@@ -59,9 +59,10 @@ const getBlingToken = async (code) => {
 };
 
 // Função para buscar pedidos "Aguardando Retirada" no Bling (VERSÃO FINAL E PRECISA)
+// Função para buscar pedidos no Bling (versão simples, sem filtro)
 const getBlingOrders = async (token) => {
-    // Usamos o parâmetro 'filtros' para garantir que a API retorne APENAS o status desejado.
-    const url = 'https://www.bling.com.br/Api/v3/pedidos/vendas?filtros=idSituacao[299240]';
+    // Vamos pegar os pedidos recentes e filtrar o status manualmente no nosso código.
+    const url = 'https://www.bling.com.br/Api/v3/pedidos/vendas';
     try {
         const response = await axios.get(url, {
             headers: { 'Authorization': `Bearer ${token}` }
@@ -179,9 +180,23 @@ const processOrders = async () => {
         return;
     }
 
-    const blingOrders = await getBlingOrders(token);
-    if (!blingOrders || blingOrders.length === 0) {
-        console.log("Nenhum pedido 'Aguardando Retirada' encontrado para processar.");
+    const allRecentBlingOrders = await getBlingOrders(token);
+    if (!allRecentBlingOrders || allRecentBlingOrders.length === 0) {
+        console.log("Nenhum pedido recente encontrado no Bling.");
+        return;
+    }
+
+    // ==================================================================
+    // FILTRO MANUAL DE STATUS - A CORREÇÃO MAIS IMPORTANTE
+    // ==================================================================
+    const STATUS_AGUARDANDO_RETIRADA = 299240;
+    const blingOrders = allRecentBlingOrders.filter(order => 
+        order.situacao && order.situacao.id === STATUS_AGUARDANDO_RETIRADA
+    );
+
+    if (blingOrders.length === 0) {
+        console.log(`Verificados ${allRecentBlingOrders.length} pedidos recentes. Nenhum com status 'Aguardando Retirada' (${STATUS_AGUARDANDO_RETIRADA}).`);
+        console.log(`[${new Date().toISOString()}] Tarefa agendada finalizada.`);
         return;
     }
 
@@ -222,7 +237,7 @@ const processOrders = async () => {
 
                 if (shopifySuccess) {
                     console.log(`  - Sucesso no Shopify.`);
-                    const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, 299241);
+                    const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, 299241); // ID de "Pronto para Retirada"
                     if (blingSuccess) {
                         console.log(`  - ✅ Sucesso Completo: Status do pedido ${blingOrderId} atualizado no Bling.`);
                     } else {
