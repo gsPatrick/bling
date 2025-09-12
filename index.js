@@ -43,42 +43,44 @@ const getBlingOrdersWithStatus = async (token, statusId) => {
 
 // Função para encontrar pedido no Shopify (VERSÃO FINAL E ROBUSTA)
 const findShopifyOrder = async (orderIdFromBling) => {
-    // Este método de busca é mais flexível e inclui pedidos arquivados.
-    const searchQuery = `id:${orderIdFromBling}`;
+    // Este método busca o pedido diretamente pelo seu ID Global (GID),
+    // o que é instantâneo e não depende do índice de busca do Shopify.
+    const shopifyGid = `gid://shopify/Order/${orderIdFromBling}`;
     const query = `
-      query searchOrderById($query: String!) {
-        orders(first: 1, query: $query, sortKey: CREATED_AT) {
-          edges {
-            node {
-              id
-              name
-              displayFinancialStatus
-              fulfillmentOrders(first: 10) {
-                edges {
-                  node { id, status, requestStatus }
-                }
+      query getOrderById($id: ID!) {
+        node(id: $id) {
+          ... on Order {
+            id
+            name
+            displayFinancialStatus
+            fulfillmentOrders(first: 10) {
+              edges {
+                node { id, status, requestStatus }
               }
             }
           }
         }
       }`;
-    const variables = { query: searchQuery };
+    const variables = { id: shopifyGid };
     try {
-        const response = await axios.post(process.env.SHOPIFY_API_URL, { query, variables }, { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } });
+        const response = await axios.post(process.env.SHOPIFY_API_URL, { query, variables }, {
+            headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' }
+        });
 
         if (response.data.errors) {
-            console.error(`  - ERRO DE QUERY GRAPHQL para o ID ${orderIdFromBling}:`, response.data.errors);
+            console.error(`  - ERRO DE QUERY GRAPHQL para o ID GID ${shopifyGid}:`, response.data.errors);
             return null;
         }
-
-        const edges = response.data.data.orders.edges;
-        if (edges && edges.length > 0) {
-            return edges[0].node;
+        
+        const orderNode = response.data.data.node;
+        // Se o node for encontrado E tiver um ID (confirmando que é um pedido), retorne-o.
+        if (orderNode && orderNode.id) {
+            return orderNode;
         }
 
-        return null; // Retorna nulo se não encontrar nada
+        return null;
     } catch (error) {
-        console.error(`  - ERRO DE CONEXÃO na API Shopify para o ID ${orderIdFromBling}:`, error.message);
+        console.error(`  - ERRO DE CONEXÃO na API Shopify para o ID GID ${shopifyGid}:`, error.message);
         return null;
     }
 };
