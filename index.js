@@ -15,7 +15,7 @@ let tokenCache = {
     updatedAt: null,
 };
 
-// Função para salvar o token no cache em memória
+// Funções para gerenciar o token em memória
 const saveTokenToCache = (tokenData) => {
     tokenCache.token = tokenData.access_token;
     tokenCache.refreshToken = tokenData.refresh_token;
@@ -25,7 +25,6 @@ const saveTokenToCache = (tokenData) => {
     return Promise.resolve();
 };
 
-// Função para buscar o token do cache em memória
 const getTokenFromCache = () => {
     if (tokenCache.token) {
         return Promise.resolve(tokenCache.token);
@@ -59,20 +58,22 @@ const getBlingToken = async (code) => {
     }
 };
 
-// Função para buscar pedidos "Aguardando Retirada" no Bling
+// Função para buscar pedidos "Aguardando Retirada" no Bling (VERSÃO FINAL E PRECISA)
 const getBlingOrders = async (token) => {
+    // Usamos o parâmetro 'filtros' para garantir que a API retorne APENAS o status desejado.
+    const url = 'https://www.bling.com.br/Api/v3/pedidos/vendas?filtros=idSituacao[299240]';
     try {
-        const response = await axios.get('https://www.bling.com.br/Api/v3/pedidos/vendas?idSituacao=299240', {
+        const response = await axios.get(url, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
-        return response.data.data;
+        return response.data && response.data.data ? response.data.data : [];
     } catch (error) {
         console.error("Erro ao buscar pedidos no Bling:", error.response?.data || error.message);
         return [];
     }
 };
 
-// Função para encontrar pedido no Shopify pelo ID (VERSÃO DEFINITIVA)
+// Função para encontrar pedido no Shopify pelo ID
 const findShopifyOrder = async (orderIdFromBling) => {
     const shopifyGid = `gid://shopify/Order/${orderIdFromBling}`;
     const query = `
@@ -111,19 +112,13 @@ const findShopifyOrder = async (orderIdFromBling) => {
     }
 };
 
-// Função para marcar um pedido como pronto para retirada no Shopify (usando a mutação correta)
+// Função para marcar um pedido como pronto para retirada no Shopify
 const markAsReadyForPickupInShopify = async (fulfillmentOrderId) => {
     const mutation = `
       mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) {
         fulfillmentCreateV2(fulfillment: $fulfillment) {
-          fulfillment {
-            id
-            status
-          }
-          userErrors {
-            field
-            message
-          }
+          fulfillment { id status }
+          userErrors { field message }
         }
       }`;
     const variables = {
@@ -161,13 +156,10 @@ const updateBlingOrderStatus = async (token, blingOrderId, newStatusId) => {
     }
 };
 
-
 // --- WEBHOOK (para autenticação inicial) ---
 app.get('/webhook/bling/callback', async (req, res) => {
     const { code } = req.query;
-    if (!code) {
-        return res.status(400).send("Parâmetro 'code' ausente.");
-    }
+    if (!code) return res.status(400).send("Parâmetro 'code' ausente.");
     try {
         console.log("Recebido código de autorização. Solicitando token...");
         const tokenData = await getBlingToken(code);
@@ -178,32 +170,30 @@ app.get('/webhook/bling/callback', async (req, res) => {
     }
 });
 
-
 // --- LÓGICA PRINCIPAL DA AUTOMAÇÃO (CRON JOB) ---
 const processOrders = async () => {
-    console.log(`[${new Date().toISOString()}] Iniciando a tarefa agendada de processamento de pedidos.`);
+    console.log(`[${new Date().toISOString()}] Iniciando a tarefa agendada.`);
     const token = await getTokenFromCache();
     if (!token) {
-        console.log("Tarefa abortada: token do Bling não encontrado no cache.");
+        console.log("Tarefa abortada: token do Bling não encontrado.");
         return;
     }
 
     const blingOrders = await getBlingOrders(token);
     if (!blingOrders || blingOrders.length === 0) {
-        console.log("Nenhum pedido 'Aguardando Retirada' encontrado no Bling.");
+        console.log("Nenhum pedido 'Aguardando Retirada' encontrado para processar.");
         return;
     }
 
     const correctShopifyStoreId = parseInt(process.env.SHOPIFY_STORE_ID_IN_BLING, 10);
     if (!correctShopifyStoreId) {
-        console.error("ERRO CRÍTICO: O ID da loja Shopify (SHOPIFY_STORE_ID_IN_BLING) não está configurado no arquivo .env. Abortando.");
+        console.error("ERRO CRÍTICO: SHOPIFY_STORE_ID_IN_BLING não está no .env. Abortando.");
         return;
     }
 
-    console.log(`Encontrados ${blingOrders.length} pedidos. Filtrando pela loja ID: ${correctShopifyStoreId}...`);
+    console.log(`Encontrados ${blingOrders.length} pedido(s) com status correto. Filtrando pela loja ID: ${correctShopifyStoreId}...`);
 
     for (const order of blingOrders) {
-        // FILTRO PRINCIPAL: Ignora pedidos que não são da loja Shopify correta.
         if (!order.loja || order.loja.id !== correctShopifyStoreId) {
             continue;
         }
@@ -212,37 +202,35 @@ const processOrders = async () => {
         const shopifyOrderId = order.numeroLoja;
 
         if (!shopifyOrderId) {
-            console.warn(`- Pedido Bling ${blingOrderId}: pulando, pois não possui 'numeroLoja'.`);
+            console.warn(`- Pedido Bling ${blingOrderId}: pulando, sem 'numeroLoja'.`);
             continue;
         }
 
-        console.log(`- Processando Pedido Bling ${blingOrderId} (Shopify ID ${shopifyOrderId}) da loja correta...`);
+        console.log(`- Processando Pedido Bling ${blingOrderId} (Shopify ID ${shopifyOrderId})...`);
         const shopifyOrder = await findShopifyOrder(shopifyOrderId);
 
         if (!shopifyOrder) {
-            console.error(`  - Erro: Pedido com ID ${shopifyOrderId} não encontrado no Shopify.`);
+            console.warn(`  - Aviso: Pedido ${shopifyOrderId} não encontrado no Shopify (pode já ter sido processado/arquivado). Pulando.`);
             continue;
         }
 
         for (const fo of shopifyOrder.fulfillmentOrders.edges) {
             const fulfillmentNode = fo.node;
             if (fulfillmentNode.status === 'OPEN' && fulfillmentNode.requestStatus === 'UNSUBMITTED') {
-                console.log(`  - Fulfillment Order ${fulfillmentNode.id} está pronto para ser marcado.`);
+                console.log(`  - Fulfillment Order ${fulfillmentNode.id} está pronto.`);
                 const shopifySuccess = await markAsReadyForPickupInShopify(fulfillmentNode.id);
 
                 if (shopifySuccess) {
-                    console.log(`  - Sucesso: Pedido marcado como 'pronto para retirada' no Shopify.`);
+                    console.log(`  - Sucesso no Shopify.`);
                     const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, 299241);
                     if (blingSuccess) {
                         console.log(`  - ✅ Sucesso Completo: Status do pedido ${blingOrderId} atualizado no Bling.`);
                     } else {
-                        console.error(`  - ❌ Erro Crítico: Shopify foi atualizado, mas FALHOU ao atualizar o status no Bling para o pedido ${blingOrderId}.`);
+                        console.error(`  - ❌ Erro Crítico: Shopify OK, mas FALHA ao atualizar status no Bling para o pedido ${blingOrderId}.`);
                     }
                 } else {
-                    console.error(`  - ❌ Falha: Não foi possível marcar o pedido como 'pronto para retirada' no Shopify.`);
+                    console.error(`  - ❌ Falha ao marcar como pronto no Shopify.`);
                 }
-            } else {
-                console.log(`  - Info: Fulfillment Order ${fulfillmentNode.id} não está pronto para retirada (Status: ${fulfillmentNode.status}, Request Status: ${fulfillmentNode.requestStatus}).`);
             }
         }
     }
@@ -254,6 +242,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     cron.schedule('*/30 * * * * *', processOrders);
     console.log(`Servidor rodando na porta ${PORT}`);
-    console.log('Tarefa de processamento de pedidos agendada para executar a cada 2 minutos.');
-    console.log(`Para autorizar com o Bling, use a URL de autorização e ela te redirecionará para o callback aqui.`);
+    console.log('Tarefa agendada para executar a cada 2 minutos.');
 });
