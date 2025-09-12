@@ -8,8 +8,6 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // --- CACHE EM MEMÓRIA PARA O TOKEN ---
-// Este objeto simples servirá como nosso "banco de dados" em memória.
-// Ele será resetado toda vez que a aplicação reiniciar.
 let tokenCache = {
     token: null,
     refreshToken: null,
@@ -24,7 +22,6 @@ const saveTokenToCache = (tokenData) => {
     tokenCache.scope = tokenData.scope;
     tokenCache.updatedAt = new Date();
     console.log("Token do Bling salvo com sucesso no cache em memória.");
-    // Retornamos uma Promise para manter a consistência com a versão async do DB
     return Promise.resolve();
 };
 
@@ -38,9 +35,9 @@ const getTokenFromCache = () => {
 };
 
 
-// --- SERVIÇOS (LÓGICA DE NEGÓCIO - SEM ALTERAÇÕES AQUI) ---
+// --- SERVIÇOS (LÓGICA DE NEGÓCIO) ---
 
-// Função para obter o token do Bling usando o código de autorização
+// Função para obter o token do Bling
 const getBlingToken = async (code) => {
     const credentials = Buffer.from(`${process.env.BLING_CLIENT_ID}:${process.env.BLING_CLIENT_SECRET}`).toString('base64');
     const body = new URLSearchParams({
@@ -48,7 +45,6 @@ const getBlingToken = async (code) => {
         code: code,
         redirect_uri: process.env.BLING_REDIRECT_URI,
     });
-
     try {
         const response = await axios.post('https://bling.com.br/Api/v3/oauth/token', body, {
             headers: {
@@ -76,53 +72,40 @@ const getBlingOrders = async (token) => {
     }
 };
 
-const findShopifyOrder = async (orderNumber) => {
-    // CONSTRUÍMOS A QUERY DE BUSCA CORRETAMENTE AQUI
-    // O Shopify geralmente busca o nome do pedido com o prefixo '#'
-    const shopifySearchQuery = `name:${orderNumber}`;
-
+// Função para encontrar pedido no Shopify pelo ID (VERSÃO DEFINITIVA)
+const findShopifyOrder = async (orderIdFromBling) => {
+    const shopifyGid = `gid://shopify/Order/${orderIdFromBling}`;
     const query = `
-      query getOrderDetails($searchQuery: String!) {
-        orders(first: 1, query: $searchQuery) {
-          edges {
-            node {
-              id
-              name
-              fulfillmentOrders(first: 10) {
-                edges {
-                  node {
-                    id
-                    status
-                    requestStatus
-                  }
+      query getOrderById($id: ID!) {
+        node(id: $id) {
+          ... on Order {
+            id
+            name
+            orderNumber
+            fulfillmentOrders(first: 10) {
+              edges {
+                node {
+                  id
+                  status
+                  requestStatus
                 }
               }
             }
           }
         }
       }`;
-      
-    // A variável agora é a string de busca completa
-    const variables = { searchQuery: shopifySearchQuery };
-
+    const variables = { id: shopifyGid };
     try {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query, variables }, {
-            headers: {
-                'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
-                'Content-Type': 'application/json',
-            }
+            headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' }
         });
-        
-        if (response.data.data.orders.edges.length > 0) {
-            return response.data.data.orders.edges[0].node;
+        const orderNode = response.data.data.node;
+        if (orderNode && orderNode.id) {
+            return orderNode;
         }
-        
-        // Se chegou aqui, não encontrou nada.
         return null;
-
     } catch (error) {
-        // Adicionamos mais detalhes no log de erro para facilitar a depuração
-        console.error(`Erro na chamada da API para buscar o pedido ${orderNumber} no Shopify:`, 
+        console.error(`Erro na API ao buscar o pedido com ID GID ${shopifyGid} no Shopify:`,
             error.response?.data?.errors || error.response?.data || error.message);
         return null;
     }
@@ -145,13 +128,10 @@ const markAsReadyForPickupInShopify = async (fulfillmentOrderId) => {
       }`;
     const variables = {
         "fulfillment": {
-            "lineItemsByFulfillmentOrder": [{
-                "fulfillmentOrderId": fulfillmentOrderId
-            }],
+            "lineItemsByFulfillmentOrder": [{ "fulfillmentOrderId": fulfillmentOrderId }],
             "notifyCustomer": true
         }
     };
-
     try {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query: mutation, variables }, {
             headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' }
@@ -191,7 +171,7 @@ app.get('/webhook/bling/callback', async (req, res) => {
     try {
         console.log("Recebido código de autorização. Solicitando token...");
         const tokenData = await getBlingToken(code);
-        await saveTokenToCache(tokenData); // <<== MODIFICADO
+        await saveTokenToCache(tokenData);
         res.status(200).send("Autenticação com Bling concluída e token salvo com sucesso no cache!");
     } catch (error) {
         res.status(500).send("Falha ao processar a autenticação do Bling.");
@@ -202,7 +182,7 @@ app.get('/webhook/bling/callback', async (req, res) => {
 // --- LÓGICA PRINCIPAL DA AUTOMAÇÃO (CRON JOB) ---
 const processOrders = async () => {
     console.log(`[${new Date().toISOString()}] Iniciando a tarefa agendada de processamento de pedidos.`);
-    const token = await getTokenFromCache(); // <<== MODIFICADO
+    const token = await getTokenFromCache();
     if (!token) {
         console.log("Tarefa abortada: token do Bling não encontrado no cache.");
         return;
@@ -213,20 +193,34 @@ const processOrders = async () => {
         console.log("Nenhum pedido 'Aguardando Retirada' encontrado no Bling.");
         return;
     }
-    console.log(`Encontrados ${blingOrders.length} pedidos para processar.`);
+
+    const correctShopifyStoreId = parseInt(process.env.SHOPIFY_STORE_ID_IN_BLING, 10);
+    if (!correctShopifyStoreId) {
+        console.error("ERRO CRÍTICO: O ID da loja Shopify (SHOPIFY_STORE_ID_IN_BLING) não está configurado no arquivo .env. Abortando.");
+        return;
+    }
+
+    console.log(`Encontrados ${blingOrders.length} pedidos. Filtrando pela loja ID: ${correctShopifyStoreId}...`);
 
     for (const order of blingOrders) {
+        // FILTRO PRINCIPAL: Ignora pedidos que não são da loja Shopify correta.
+        if (!order.loja || order.loja.id !== correctShopifyStoreId) {
+            continue;
+        }
+
         const blingOrderId = order.id;
-        const shopifyOrderNumber = order.numeroLoja;
-        if (!shopifyOrderNumber) {
+        const shopifyOrderId = order.numeroLoja;
+
+        if (!shopifyOrderId) {
             console.warn(`- Pedido Bling ${blingOrderId}: pulando, pois não possui 'numeroLoja'.`);
             continue;
         }
 
-        console.log(`- Processando Pedido Bling ${blingOrderId} (Shopify #${shopifyOrderNumber})...`);
-        const shopifyOrder = await findShopifyOrder(shopifyOrderNumber);
+        console.log(`- Processando Pedido Bling ${blingOrderId} (Shopify ID ${shopifyOrderId}) da loja correta...`);
+        const shopifyOrder = await findShopifyOrder(shopifyOrderId);
+
         if (!shopifyOrder) {
-            console.error(`  - Erro: Pedido #${shopifyOrderNumber} não encontrado no Shopify.`);
+            console.error(`  - Erro: Pedido com ID ${shopifyOrderId} não encontrado no Shopify.`);
             continue;
         }
 
@@ -248,20 +242,18 @@ const processOrders = async () => {
                     console.error(`  - ❌ Falha: Não foi possível marcar o pedido como 'pronto para retirada' no Shopify.`);
                 }
             } else {
-                console.log(`  - Info: Fulfillment Order ${fulfillmentNode.id} não está pronto para retirada (Status: ${fulfillmentNode.status}).`);
+                console.log(`  - Info: Fulfillment Order ${fulfillmentNode.id} não está pronto para retirada (Status: ${fulfillmentNode.status}, Request Status: ${fulfillmentNode.requestStatus}).`);
             }
         }
     }
     console.log(`[${new Date().toISOString()}] Tarefa agendada finalizada.`);
 };
 
-
 // --- INICIALIZAÇÃO ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    // A inicialização do banco de dados não é mais necessária.
     cron.schedule('*/30 * * * * *', processOrders);
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log('Tarefa de processamento de pedidos agendada para executar a cada 2 minutos.');
-    console.log(`Para autorizar com o Bling, acesse o endpoint de callback: /webhook/bling/callback`);
+    console.log(`Para autorizar com o Bling, use a URL de autorização e ela te redirecionará para o callback aqui.`);
 });
