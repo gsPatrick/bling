@@ -8,27 +8,17 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // --- CACHE EM MEMÓRIA PARA O TOKEN ---
-let tokenCache = {
-    token: null,
-    refreshToken: null,
-    scope: null,
-    updatedAt: null,
-};
+let tokenCache = { token: null };
 
 // Funções para gerenciar o token em memória
 const saveTokenToCache = (tokenData) => {
     tokenCache.token = tokenData.access_token;
-    tokenCache.refreshToken = tokenData.refresh_token;
-    tokenCache.scope = tokenData.scope;
-    tokenCache.updatedAt = new Date();
     console.log("Token do Bling salvo com sucesso no cache em memória.");
     return Promise.resolve();
 };
 
 const getTokenFromCache = () => {
-    if (tokenCache.token) {
-        return Promise.resolve(tokenCache.token);
-    }
+    if (tokenCache.token) return Promise.resolve(tokenCache.token);
     console.warn("Nenhum token encontrado no cache. Por favor, autorize a aplicação primeiro.");
     return Promise.resolve(null);
 };
@@ -58,10 +48,8 @@ const getBlingToken = async (code) => {
     }
 };
 
-// Função para buscar pedidos "Aguardando Retirada" no Bling (VERSÃO FINAL E PRECISA)
-// Função para buscar pedidos no Bling (versão simples, sem filtro)
+// Função para buscar pedidos recentes no Bling (sem filtro de status na API)
 const getBlingOrders = async (token) => {
-    // Vamos pegar os pedidos recentes e filtrar o status manualmente no nosso código.
     const url = 'https://www.bling.com.br/Api/v3/pedidos/vendas';
     try {
         const response = await axios.get(url, {
@@ -81,18 +69,8 @@ const findShopifyOrder = async (orderIdFromBling) => {
       query getOrderById($id: ID!) {
         node(id: $id) {
           ... on Order {
-            id
-            name
-            orderNumber
-            fulfillmentOrders(first: 10) {
-              edges {
-                node {
-                  id
-                  status
-                  requestStatus
-                }
-              }
-            }
+            id, name, orderNumber,
+            fulfillmentOrders(first: 10) { edges { node { id, status, requestStatus } } }
           }
         }
       }`;
@@ -102,13 +80,9 @@ const findShopifyOrder = async (orderIdFromBling) => {
             headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' }
         });
         const orderNode = response.data.data.node;
-        if (orderNode && orderNode.id) {
-            return orderNode;
-        }
-        return null;
+        return (orderNode && orderNode.id) ? orderNode : null;
     } catch (error) {
-        console.error(`Erro na API ao buscar o pedido com ID GID ${shopifyGid} no Shopify:`,
-            error.response?.data?.errors || error.response?.data || error.message);
+        console.error(`Erro na API ao buscar o pedido GID ${shopifyGid} no Shopify:`, error.response?.data?.errors || error.response?.data || error.message);
         return null;
     }
 };
@@ -118,15 +92,11 @@ const markAsReadyForPickupInShopify = async (fulfillmentOrderId) => {
     const mutation = `
       mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) {
         fulfillmentCreateV2(fulfillment: $fulfillment) {
-          fulfillment { id status }
-          userErrors { field message }
+          fulfillment { id, status }, userErrors { field, message }
         }
       }`;
     const variables = {
-        "fulfillment": {
-            "lineItemsByFulfillmentOrder": [{ "fulfillmentOrderId": fulfillmentOrderId }],
-            "notifyCustomer": true
-        }
+        "fulfillment": { "lineItemsByFulfillmentOrder": [{ "fulfillmentOrderId": fulfillmentOrderId }], "notifyCustomer": true }
     };
     try {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query: mutation, variables }, {
@@ -186,13 +156,9 @@ const processOrders = async () => {
         return;
     }
 
-    // ==================================================================
-    // FILTRO MANUAL DE STATUS - A CORREÇÃO MAIS IMPORTANTE
-    // ==================================================================
+    // Filtro manual de status - Apenas pedidos "Aguardando Retirada"
     const STATUS_AGUARDANDO_RETIRADA = 299240;
-    const blingOrders = allRecentBlingOrders.filter(order => 
-        order.situacao && order.situacao.id === STATUS_AGUARDANDO_RETIRADA
-    );
+    const blingOrders = allRecentBlingOrders.filter(order => order.situacao && order.situacao.id === STATUS_AGUARDANDO_RETIRADA);
 
     if (blingOrders.length === 0) {
         console.log(`Verificados ${allRecentBlingOrders.length} pedidos recentes. Nenhum com status 'Aguardando Retirada' (${STATUS_AGUARDANDO_RETIRADA}).`);
@@ -237,9 +203,15 @@ const processOrders = async () => {
 
                 if (shopifySuccess) {
                     console.log(`  - Sucesso no Shopify.`);
-                    const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, 299241); // ID de "Pronto para Retirada"
+                    
+                    // ==================================================================
+                    // MUDANÇA FINAL: ATUALIZANDO PARA "ATENDIDO" (ID 9)
+                    // ==================================================================
+                    const STATUS_ATENDIDO_BLING = 9;
+                    const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
+                    
                     if (blingSuccess) {
-                        console.log(`  - ✅ Sucesso Completo: Status do pedido ${blingOrderId} atualizado no Bling.`);
+                        console.log(`  - ✅ Sucesso Completo: Status do pedido ${blingOrderId} atualizado para 'Atendido' no Bling.`);
                     } else {
                         console.error(`  - ❌ Erro Crítico: Shopify OK, mas FALHA ao atualizar status no Bling para o pedido ${blingOrderId}.`);
                     }
