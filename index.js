@@ -76,11 +76,14 @@ const getBlingOrders = async (token) => {
     }
 };
 
-// Função para encontrar pedido no Shopify pelo número
 const findShopifyOrder = async (orderNumber) => {
+    // CONSTRUÍMOS A QUERY DE BUSCA CORRETAMENTE AQUI
+    // O Shopify geralmente busca o nome do pedido com o prefixo '#'
+    const shopifySearchQuery = `name:${orderNumber}`;
+
     const query = `
-      query getOrderDetails($orderNumber: String!) {
-        orders(first: 1, query: $orderNumber) {
+      query getOrderDetails($searchQuery: String!) {
+        orders(first: 1, query: $searchQuery) {
           edges {
             node {
               id
@@ -98,7 +101,9 @@ const findShopifyOrder = async (orderNumber) => {
           }
         }
       }`;
-    const variables = { orderNumber: `name:${orderNumber}` };
+      
+    // A variável agora é a string de busca completa
+    const variables = { searchQuery: shopifySearchQuery };
 
     try {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query, variables }, {
@@ -107,12 +112,18 @@ const findShopifyOrder = async (orderNumber) => {
                 'Content-Type': 'application/json',
             }
         });
+        
         if (response.data.data.orders.edges.length > 0) {
             return response.data.data.orders.edges[0].node;
         }
+        
+        // Se chegou aqui, não encontrou nada.
         return null;
+
     } catch (error) {
-        console.error(`Erro ao buscar pedido ${orderNumber} no Shopify:`, error.response?.data || error.message);
+        // Adicionamos mais detalhes no log de erro para facilitar a depuração
+        console.error(`Erro na chamada da API para buscar o pedido ${orderNumber} no Shopify:`, 
+            error.response?.data?.errors || error.response?.data || error.message);
         return null;
     }
 };
@@ -249,7 +260,7 @@ const processOrders = async () => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     // A inicialização do banco de dados não é mais necessária.
-    cron.schedule('*/2 * * * *', processOrders);
+    cron.schedule('*/30 * * * * *', processOrders);
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log('Tarefa de processamento de pedidos agendada para executar a cada 2 minutos.');
     console.log(`Para autorizar com o Bling, acesse o endpoint de callback: /webhook/bling/callback`);
