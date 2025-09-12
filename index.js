@@ -145,8 +145,6 @@ app.get('/webhook/bling/callback', async (req, res) => {
 const processOrders = async () => {
     console.log(`[${new Date().toISOString()}] Iniciando a tarefa agendada.`);
     const token = await getTokenFromCache();
-        await findBlingOrderStatus(token, '23816787546');
-
     if (!token) {
         console.log("Tarefa abortada: token do Bling não encontrado.");
         return;
@@ -206,10 +204,7 @@ const processOrders = async () => {
                 if (shopifySuccess) {
                     console.log(`  - Sucesso no Shopify.`);
                     
-                    // ==================================================================
-                    // MUDANÇA FINAL: ATUALIZANDO PARA "ATENDIDO" (ID 9)
-                    // ==================================================================
-                    const STATUS_ATENDIDO_BLING = 9;
+                    const STATUS_ATENDIDO_BLING = 9; // ID "Atendido" confirmado
                     const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
                     
                     if (blingSuccess) {
@@ -224,32 +219,6 @@ const processOrders = async () => {
         }
     }
     console.log(`[${new Date().toISOString()}] Tarefa agendada finalizada.`);
-};
-
-const findBlingOrderStatus = async (token, orderId) => {
-    // Verifica se o token existe antes de continuar
-    if (!token) {
-        console.log("\n--- BUSCA DE STATUS CANCELADA: Token do Bling não está disponível. ---\n");
-        return;
-    }
-    
-    const url = `https://www.bling.com.br/Api/v3/pedidos/vendas/${orderId}`;
-    console.log(`\n--- INICIANDO BUSCA DE STATUS PARA O PEDIDO ${orderId} ---\n`);
-    try {
-        const response = await axios.get(url, {
-            headers: { 'Authorization': `Bearer ${token}` }
-        });
-        
-        const situacao = response.data.data.situacao;
-
-        console.log("✅ SUCESSO! Informações da situação encontradas:");
-        // Usamos JSON.stringify para mostrar o objeto completo de forma legível
-        console.log(JSON.stringify(situacao, null, 2));
-        
-    } catch (error) {
-        console.error("❌ ERRO ao buscar o status do pedido:", error.response?.data || error.message);
-    }
-    console.log(`\n--- FIM DA BUSCA DE STATUS --- \n`);
 };
 
 // --- INICIALIZAÇÃO ---
