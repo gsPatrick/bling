@@ -156,9 +156,15 @@ const processOrders = async () => {
         return;
     }
 
-    // Filtro manual de status - Apenas pedidos "Aguardando Retirada"
+    // ==================================================================
+    // CORREÇÃO FINAL DO FILTRO DE STATUS
+    // A lista de pedidos usa 'idSituacao' diretamente no objeto.
+    // ==================================================================
     const STATUS_AGUARDANDO_RETIRADA = 299240;
-    const blingOrders = allRecentBlingOrders.filter(order => order.situacao && order.situacao.id === STATUS_AGUARDANDO_RETIRADA);
+    const blingOrders = allRecentBlingOrders.filter(order => 
+        // Usamos '==' para comparar a string "299240" com o número 299240
+        order.idSituacao == STATUS_AGUARDANDO_RETIRADA
+    );
 
     if (blingOrders.length === 0) {
         console.log(`Verificados ${allRecentBlingOrders.length} pedidos recentes. Nenhum com status 'Aguardando Retirada' (${STATUS_AGUARDANDO_RETIRADA}).`);
@@ -175,15 +181,18 @@ const processOrders = async () => {
     console.log(`Encontrados ${blingOrders.length} pedido(s) com status correto. Filtrando pela loja ID: ${correctShopifyStoreId}...`);
 
     for (const order of blingOrders) {
-        if (!order.loja || order.loja.id !== correctShopifyStoreId) {
+        // O filtro de loja usa a propriedade 'loja', que parece ser uma string na lista.
+        // Convertemos para número para garantir a comparação correta.
+        if (!order.loja || parseInt(order.loja, 10) !== correctShopifyStoreId) {
             continue;
         }
 
         const blingOrderId = order.id;
-        const shopifyOrderId = order.numeroLoja;
+        // O ID do Shopify na lista simplificada está no campo 'idMagento'.
+        const shopifyOrderId = order.idMagento;
 
         if (!shopifyOrderId) {
-            console.warn(`- Pedido Bling ${blingOrderId}: pulando, sem 'numeroLoja'.`);
+            console.warn(`- Pedido Bling ${blingOrderId}: pulando, sem 'idMagento' (ID do Shopify).`);
             continue;
         }
 
@@ -203,10 +212,8 @@ const processOrders = async () => {
 
                 if (shopifySuccess) {
                     console.log(`  - Sucesso no Shopify.`);
-                    
-                    const STATUS_ATENDIDO_BLING = 9; // ID "Atendido" confirmado
+                    const STATUS_ATENDIDO_BLING = 9;
                     const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
-                    
                     if (blingSuccess) {
                         console.log(`  - ✅ Sucesso Completo: Status do pedido ${blingOrderId} atualizado para 'Atendido' no Bling.`);
                     } else {
@@ -220,7 +227,6 @@ const processOrders = async () => {
     }
     console.log(`[${new Date().toISOString()}] Tarefa agendada finalizada.`);
 };
-
 // --- INICIALIZAÇÃO ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
