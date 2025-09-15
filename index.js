@@ -1,3 +1,6 @@
+
+
+
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -59,9 +62,22 @@ const getBlingOrdersWithStatus = async (token, statusId) => {
     }
 };
 
+// MAPEAMENTO DE IDs DO BLING PARA IDs DO SHOPIFY
+const blingToShopifyIdMapping = {
+    '2143': '5804091048247',
+    // Adicione outros mapeamentos conforme necessário
+    // '1234': '5678901234567',
+    // '5678': '9012345678901'
+};
+
 // Busca pedido no Shopify pelo ID
 const findShopifyOrderId = async (orderIdFromBling) => {
-    const shopifyGid = `gid://shopify/Order/${orderIdFromBling}`;
+    // Verifica se existe um mapeamento específico para este ID do Bling
+    let shopifyOrderId = blingToShopifyIdMapping[orderIdFromBling] || orderIdFromBling;
+    
+    console.log(`  - Buscando pedido Bling #${orderIdFromBling} no Shopify usando ID: ${shopifyOrderId}`);
+    
+    const shopifyGid = `gid://shopify/Order/${shopifyOrderId}`;
     const query = `
         query getOrderById($id: ID!) { 
             node(id: $id) { 
@@ -70,13 +86,39 @@ const findShopifyOrderId = async (orderIdFromBling) => {
                     name
                     tags
                     displayFulfillmentStatus
-                    fulfillmentStatus
                     displayFinancialStatus
-                    lineItems(first: 5) {
+                    createdAt
+                    lineItems(first: 50) {
                         nodes {
                             id
                             title
-                            fulfillmentStatus
+                            quantity
+                            variant {
+                                id
+                                title
+                            }
+                            product {
+                                id
+                                title
+                            }
+                        }
+                    }
+                    fulfillmentOrders(first: 50) {
+                        nodes {
+                            id
+                            status
+                            requestStatus
+                            lineItems(first: 50) {
+                                nodes {
+                                    id
+                                    lineItem {
+                                        id
+                                        title
+                                    }
+                                    remainingQuantity
+                                    totalQuantity
+                                }
+                            }
                         }
                     }
                 } 
@@ -101,10 +143,276 @@ const findShopifyOrderId = async (orderIdFromBling) => {
         }
         
         const orderNode = response.data.data.node;
-        return (orderNode && orderNode.id) ? orderNode : null;
+        if (orderNode && orderNode.id) {
+            console.log(`  - ✅ SUCESSO: Pedido encontrado no Shopify: ${orderNode.name}`);
+            return orderNode;
+        } else {
+            console.log(`  - ❌ AVISO: Pedido não encontrado no Shopify para o ID ${shopifyOrderId}`);
+            return null;
+        }
     } catch (error) { 
         console.error(`  - ERRO DE CONEXÃO na API Shopify para o ID GID ${shopifyGid}:`, error.message); 
         return null; 
+    }
+};
+
+// FUNÇÃO PRINCIPAL: Cria fulfillment para pickup local (sem marcar como pronto ainda)
+const createLocalPickupFulfillment = async (shopifyOrder) => {
+    console.log(`    → Criando fulfillment de pickup LOCAL para pedido ${shopifyOrder.name}`);
+    
+    const fulfillmentOrders = shopifyOrder.fulfillmentOrders?.nodes || [];
+    
+    if (fulfillmentOrders.length === 0) {
+        console.error(`    → ERRO: Não há fulfillment orders disponíveis para o pedido ${shopifyOrder.name}`);
+        console.log(`    → Isso indica que o pedido ainda não foi processado pelo Shopify`);
+        return false;
+    }
+    
+    console.log(`    → Encontrados ${fulfillmentOrders.length} fulfillment order(s) para processar`);
+    
+    // Para cada fulfillment order, cria um fulfillment
+    let successCount = 0;
+    
+    for (const fulfillmentOrder of fulfillmentOrders) {
+        const lineItems = fulfillmentOrder.lineItems?.nodes || [];
+        
+        if (lineItems.length === 0) {
+            console.warn(`    → AVISO: Nenhum line item encontrado no fulfillment order ${fulfillmentOrder.id}`);
+            continue;
+        }
+        
+        console.log(`    → Processando fulfillment order ${fulfillmentOrder.id} com ${lineItems.length} item(s)`);
+        
+        // Prepara os line items para o fulfillment
+        const fulfillmentOrderLineItems = lineItems.map(item => ({
+            id: item.id,
+            quantity: item.remainingQuantity || item.totalQuantity
+        }));
+        
+        const mutation = `
+            mutation fulfillmentCreate($fulfillment: FulfillmentV2Input!) {
+                fulfillmentCreate(fulfillment: $fulfillment) {
+                    fulfillment {
+                        id
+                        status
+                        displayStatus
+                        createdAt
+                    }
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }`;
+        
+        const variables = {
+            fulfillment: {
+                lineItemsByFulfillmentOrder: [{
+                    fulfillmentOrderId: fulfillmentOrder.id,
+                    fulfillmentOrderLineItems: fulfillmentOrderLineItems
+                }],
+                notifyCustomer: false, // Não notifica ainda, só quando marcar como pronto
+                trackingInfo: {
+                    company: "Retirada Local",
+                    number: `PICKUP-${shopifyOrder.name}`
+                }
+            }
+        };
+        
+        try {
+            const response = await axios.post(process.env.SHOPIFY_API_URL, { 
+                query: mutation, 
+                variables 
+            }, { 
+                headers: { 
+                    'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 
+                    'Content-Type': 'application/json' 
+                } 
+            });
+            
+            console.log(`    → Resposta da API Shopify:`, JSON.stringify(response.data, null, 2));
+            
+            if (response.data.errors) {
+                console.error(`    → ERRO DE GRAPHQL:`, response.data.errors);
+                continue;
+            }
+            
+            const result = response.data.data?.fulfillmentCreate;
+            const userErrors = result?.userErrors || [];
+            
+            if (userErrors.length > 0) {
+                console.error(`    → ERRO (userErrors):`, userErrors);
+                continue;
+            }
+            
+            const fulfillment = result?.fulfillment;
+            if (fulfillment) {
+                console.log(`    → ✅ SUCESSO! Fulfillment criado: ${fulfillment.id}`);
+                console.log(`    → Status: ${fulfillment.status} (${fulfillment.displayStatus})`);
+                successCount++;
+            }
+            
+        } catch (error) {
+            console.error(`    → ERRO DE CONEXÃO:`, error.response?.data || error.message);
+            continue;
+        }
+    }
+    
+    return successCount > 0;
+};
+
+// FUNÇÃO: Marca fulfillment orders como PRONTO PARA RETIRADA
+const markFulfillmentOrdersReadyForPickup = async (shopifyOrder) => {
+    console.log(`    → Marcando fulfillment orders como PRONTO PARA RETIRADA para pedido ${shopifyOrder.name}`);
+    
+    const fulfillmentOrders = shopifyOrder.fulfillmentOrders?.nodes || [];
+    
+    if (fulfillmentOrders.length === 0) {
+        console.error(`    → ERRO: Não há fulfillment orders para marcar como pronto`);
+        return false;
+    }
+    
+    let successCount = 0;
+    
+    for (const fulfillmentOrder of fulfillmentOrders) {
+        console.log(`    → Processando fulfillment order: ${fulfillmentOrder.id} (status: ${fulfillmentOrder.status})`);
+        
+        // Verifica se pode ser marcado como pronto para retirada
+        if (fulfillmentOrder.status === 'SCHEDULED' || fulfillmentOrder.status === 'OPEN') {
+            const lineItems = fulfillmentOrder.lineItems?.nodes || [];
+            
+            if (lineItems.length === 0) {
+                console.warn(`    → AVISO: Nenhum line item encontrado no fulfillment order ${fulfillmentOrder.id}`);
+                continue;
+            }
+            
+            const preparedResult = await prepareLineItemsForPickup(fulfillmentOrder.id, lineItems);
+            
+            if (preparedResult) {
+                successCount++;
+                console.log(`    → ✅ SUCESSO: Fulfillment order ${fulfillmentOrder.id} marcado como PRONTO PARA RETIRADA`);
+            } else {
+                console.error(`    → ❌ ERRO: Falha ao marcar fulfillment order ${fulfillmentOrder.id} como pronto`);
+            }
+        } else if (fulfillmentOrder.status === 'CLOSED') {
+            console.log(`    → Fulfillment order ${fulfillmentOrder.id} já foi fechado (considerando como sucesso)`);
+            successCount++;
+        } else {
+            console.log(`    → Fulfillment order ${fulfillmentOrder.id} em status ${fulfillmentOrder.status} - tentando marcar mesmo assim...`);
+            
+            const lineItems = fulfillmentOrder.lineItems?.nodes || [];
+            if (lineItems.length > 0) {
+                const preparedResult = await prepareLineItemsForPickup(fulfillmentOrder.id, lineItems);
+                if (preparedResult) {
+                    successCount++;
+                    console.log(`    → ✅ SUCESSO inesperado: Fulfillment order ${fulfillmentOrder.id} marcado como PRONTO PARA RETIRADA`);
+                }
+            }
+        }
+    }
+    
+    return successCount > 0;
+};
+
+// FUNÇÃO: Implementa a API do Shopify para marcar como pronto para retirada
+const prepareLineItemsForPickup = async (fulfillmentOrderId, lineItems) => {
+    console.log(`      → Marcando ${lineItems.length} item(s) como PRONTO PARA RETIRADA no fulfillment order: ${fulfillmentOrderId}`);
+    
+    // Prepara os line items com suas quantidades
+    const fulfillmentOrderLineItems = lineItems.map(item => ({
+        id: item.id,
+        quantity: item.remainingQuantity || item.totalQuantity
+    }));
+    
+    const mutation = `
+        mutation fulfillmentOrderLineItemsPreparedForPickup($input: FulfillmentOrderLineItemsPreparedForPickupInput!) {
+            fulfillmentOrderLineItemsPreparedForPickup(input: $input) {
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }`;
+    
+    const variables = {
+        input: {
+            id: fulfillmentOrderId,
+            fulfillmentOrderLineItems: fulfillmentOrderLineItems
+        }
+    };
+    
+    try {
+        const response = await axios.post(process.env.SHOPIFY_API_URL, { 
+            query: mutation, 
+            variables 
+        }, { 
+            headers: { 
+                'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 
+                'Content-Type': 'application/json' 
+            } 
+        });
+        
+        console.log(`      → Resposta da API Shopify:`, JSON.stringify(response.data, null, 2));
+        
+        if (response.data.errors) {
+            console.error(`      → ERRO DE GRAPHQL:`, response.data.errors);
+            return false;
+        }
+        
+        const result = response.data.data?.fulfillmentOrderLineItemsPreparedForPickup;
+        const userErrors = result?.userErrors || [];
+        
+        if (userErrors.length > 0) {
+            console.error(`      → ERRO (userErrors):`, userErrors);
+            return false;
+        }
+        
+        console.log(`      → ✅ SUCESSO! Items marcados como PRONTO PARA RETIRADA`);
+        return true;
+        
+    } catch (error) {
+        console.error(`      → ERRO DE CONEXÃO:`, error.response?.data || error.message);
+        return false;
+    }
+};
+
+// FUNÇÃO PRINCIPAL CORRIGIDA: Garante que o pedido seja marcado como PRONTO PARA RETIRADA
+const markOrderReadyForPickup = async (shopifyOrder) => {
+    console.log(`    → OBJETIVO: Marcar pedido ${shopifyOrder.name} como PRONTO PARA RETIRADA`);
+    
+    const fulfillmentOrders = shopifyOrder.fulfillmentOrders?.nodes || [];
+    console.log(`    → Status atual: ${shopifyOrder.displayFulfillmentStatus}`);
+    console.log(`    → Fulfillment Orders encontrados: ${fulfillmentOrders.length}`);
+    
+    if (fulfillmentOrders.length === 0) {
+        console.log(`    → PROBLEMA: Não há fulfillment orders. O pedido precisa ser processado primeiro.`);
+        console.log(`    → AÇÃO: Tentando criar fulfillment de pickup local...`);
+        
+        // Primeira tentativa: criar fulfillment local
+        const createResult = await createLocalPickupFulfillment(shopifyOrder);
+        
+        if (!createResult) {
+            console.error(`    → ❌ FALHA: Não conseguiu criar fulfillment local`);
+            return false;
+        }
+        
+        console.log(`    → ✅ Fulfillment local criado com sucesso!`);
+        
+        // Busca o pedido novamente para pegar os novos fulfillment orders
+        console.log(`    → Buscando pedido atualizado...`);
+        const updatedOrder = await findShopifyOrderId(shopifyOrder.id.split('/').pop());
+        
+        if (!updatedOrder || !updatedOrder.fulfillmentOrders?.nodes?.length) {
+            console.error(`    → ❌ PROBLEMA: Mesmo após criar fulfillment, não há fulfillment orders`);
+            return false;
+        }
+        
+        // Agora marca como pronto para retirada
+        return await markFulfillmentOrdersReadyForPickup(updatedOrder);
+    } else {
+        // Já há fulfillment orders, marca diretamente como pronto para retirada
+        console.log(`    → AÇÃO: Marcando fulfillment orders existentes como PRONTO PARA RETIRADA`);
+        return await markFulfillmentOrdersReadyForPickup(shopifyOrder);
     }
 };
 
@@ -139,229 +447,125 @@ const addTagToShopifyOrder = async (shopifyGid, tag) => {
             } 
         });
         
-        console.log(`    → Resposta da API Shopify:`, JSON.stringify(response.data, null, 2));
+        if (response.data.errors) { 
+            console.error(`    → ERRO DE GRAPHQL ao adicionar tag:`, response.data.errors); 
+            return false; 
+        }
         
-        if (response.data.errors) {
-            console.error(`    → ERRO DE GRAPHQL ao adicionar tag:`, response.data.errors);
+        const result = response.data.data?.tagsAdd;
+        const userErrors = result?.userErrors || [];
+        
+        if (userErrors.length > 0) {
+            console.error(`    → ERRO (userErrors) ao adicionar tag:`, userErrors);
             return false;
         }
         
-        const tagsAddResult = response.data.data?.tagsAdd;
-        const userErrors = tagsAddResult?.userErrors;
-        
-        if (userErrors && userErrors.length > 0) {
-            console.error(`    → ERRO (userErrors) ao adicionar tag ao pedido ${shopifyGid}:`, userErrors);
-            return false;
-        }
-        
-        const updatedTags = tagsAddResult?.node?.tags || [];
-        console.log(`    → SUCESSO! Tags atuais do pedido:`, updatedTags);
-        
+        console.log(`    → ✅ SUCESSO! Tag "${tag}" adicionada ao pedido`);
         return true;
+        
     } catch (error) { 
-        console.error(`    → ERRO DE CONEXÃO ao adicionar tag ao pedido ${shopifyGid}:`, error.response?.data || error.message); 
+        console.error(`    → ERRO DE CONEXÃO ao adicionar tag:`, error.response?.data || error.message); 
         return false; 
     }
 };
 
-// FUNÇÃO MELHORADA: Atualiza status do pedido no Bling
-const updateBlingOrderStatus = async (token, blingOrderId, newStatusId) => {
-    console.log(`    → Tentando atualizar pedido ${blingOrderId} para status ${newStatusId} no Bling`);
-    
-    try {
-        const response = await axios.put(
-            `https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`, 
-            { idSituacao: newStatusId }, 
-            { 
-                headers: { 
-                    'Authorization': `Bearer ${token}`, 
-                    'Content-Type': 'application/json' 
-                } 
-            }
-        );
-        
-        console.log(`    → SUCESSO! Pedido ${blingOrderId} atualizado no Bling`);
-        return true;
-    } catch (error) { 
-        console.error(`    → ERRO DETALHADO ao atualizar pedido ${blingOrderId} no Bling:`);
-        console.error(`    → Status HTTP:`, error.response?.status);
-        console.error(`    → Dados do erro:`, JSON.stringify(error.response?.data, null, 2));
-        
-        // Verifica se é erro de validação específico
-        if (error.response?.data?.error?.type === 'VALIDATION_ERROR') {
-            const fields = error.response.data.error.fields || [];
-            console.error(`    → Campos com erro:`, fields.map(f => `${f.field}: ${f.message}`).join(', '));
-        }
-        
-        return false; 
-    }
-};
+// --- ROTAS DA API ---
 
-// --- WEBHOOK ---
+// Rota para iniciar o processo de autorização do Bling
+app.get('/webhook/bling/auth', (req, res) => {
+    const authUrl = `https://bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${process.env.BLING_CLIENT_ID}&state=loja_amouh`;
+    res.redirect(authUrl);
+});
+
+// Rota de callback para o Bling
 app.get('/webhook/bling/callback', async (req, res) => {
-    const { code } = req.query;
-    if (!code) return res.status(400).send("Parâmetro 'code' ausente.");
+    const { code, state } = req.query;
+    if (!code) return res.status(400).send("Erro: Código de autorização não encontrado.");
     
     try {
-        console.log("Recebido código de autorização. Solicitando token...");
         const tokenData = await getBlingToken(code);
         await saveTokenToCache(tokenData);
-        res.status(200).send("Autenticação com Bling concluída e token salvo com sucesso no cache!");
-    } catch (error) { 
-        res.status(500).send("Falha ao processar a autenticação do Bling."); 
+        res.send("Autorização com Bling concluída com sucesso! O token foi salvo.");
+    } catch (error) {
+        res.status(500).send("Falha ao obter ou salvar o token do Bling.");
     }
 });
 
-// --- LÓGICA PRINCIPAL (MELHORADA) ---
-const processOrders = async () => {
-    console.log(`\n========================= [${new Date().toISOString()}] =========================`);
-    console.log("INICIANDO TAREFA: Verificação de pedidos 'Aguardando Retirada'.");
-    
+// Rota para testar a busca de pedidos (para debug)
+app.get('/test/orders', async (req, res) => {
     const token = await getTokenFromCache();
-    if (!token) { 
-        console.log("--> TAREFA ABORTADA: Token do Bling não encontrado."); 
-        return; 
-    }
-
-    const STATUS_AGUARDANDO_RETIRADA = 299240;
-    const blingOrders = await getBlingOrdersWithStatus(token, STATUS_AGUARDANDO_RETIRADA);
+    if (!token) return res.status(401).send("Token do Bling não encontrado. Autorize primeiro.");
     
-    if (!blingOrders || blingOrders.length === 0) {
-        console.log("--> RESULTADO: Nenhum pedido com status 'Aguardando Retirada' foi encontrado.");
-        console.log("============================== TAREFA FINALIZADA ==============================\n");
+    const statusId = 204574266; // ID para "Aguardando Retirada"
+    const orders = await getBlingOrdersWithStatus(token, statusId);
+    res.json(orders);
+});
+
+// --- TAREFAS AGENDADAS (CRON) ---
+
+// Função principal que executa a lógica de negócio
+const executeTask = async () => {
+    console.log(`
+========================= [${new Date().toISOString()}] =========================`);
+    console.log("🎯 OBJETIVO: Marcar pedidos como PRONTO PARA RETIRADA");
+    console.log("INICIANDO TAREFA: Verificação de pedidos 'Aguardando Retirada'.");
+
+    const token = await getTokenFromCache();
+    if (!token) {
+        console.error("FALHA CRÍTICA: Token do Bling não encontrado. A tarefa não pode continuar.");
         return;
     }
 
-    const correctShopifyStoreId = parseInt(process.env.SHOPIFY_STORE_ID_IN_BLING, 10);
-    const ordersToProcess = blingOrders.filter(order => order.loja && order.loja.id === correctShopifyStoreId);
+    const statusId = process.env.SHOPIFY_STORE_ID_IN_BLING; // ID para "Aguardando Retirada"
+    const blingOrders = await getBlingOrdersWithStatus(token, statusId);
 
-    if (ordersToProcess.length === 0) {
-        console.log(`--> ${blingOrders.length} pedido(s) encontrados, mas nenhum pertence à sua loja (ID ${correctShopifyStoreId}).`);
-        console.log("============================== TAREFA FINALIZADA ==============================\n");
+    if (blingOrders.length === 0) {
+        console.log("--> Nenhum pedido 'Aguardando Retirada' encontrado.");
+        console.log("============================== TAREFA FINALIZADA ==============================");
         return;
     }
-    
-    console.log(`--> Encontrados ${ordersToProcess.length} pedido(s) da sua loja para processar.`);
 
-    for (const order of ordersToProcess) {
-        const blingOrderId = order.id;
-        const shopifyOrderId = order.numeroLoja;
+    console.log(`--> Encontrados ${blingOrders.length} pedido(s) da sua loja para processar.`);
 
-        if (!shopifyOrderId) { 
-            console.warn(`- [Bling #${order.numero}] PULANDO: não possui 'numeroLoja'.`); 
-            continue; 
+    for (const blingOrder of blingOrders) {
+        const orderIdFromBling = blingOrder.id;
+        console.log(`
+🔄 [Bling #${orderIdFromBling}] Processando...`);
+
+        const shopifyOrder = await findShopifyOrderId(orderIdFromBling);
+
+        if (!shopifyOrder) {
+            console.log(`  - [Bling #${orderIdFromBling}] AVISO: Pedido não encontrado no Shopify.`);
+            continue;
         }
 
-        console.log(`\n- [Bling #${order.numero}] Processando... Buscando no Shopify pelo ID: ${shopifyOrderId}`);
-        const shopifyOrder = await findShopifyOrderId(shopifyOrderId);
+        // Tenta marcar o pedido como pronto para retirada
+        const success = await markOrderReadyForPickup(shopifyOrder);
 
-        if (!shopifyOrder) { 
-            console.warn(`  - [Bling #${order.numero}] AVISO: Pedido não encontrado no Shopify.`); 
-            continue; 
-        }
-        
-        console.log(`  - [Bling #${order.numero}] Pedido encontrado no Shopify: ${shopifyOrder.name}`);
-        console.log(`  - Tags atuais:`, shopifyOrder.tags);
-        
-        // Verifica se a tag já existe
-        const TAG_PRONTO_RETIRADA = "Pronto para Retirada";
-        const currentTags = shopifyOrder.tags || [];
-        
-        if (currentTags.includes(TAG_PRONTO_RETIRADA)) {
-            console.log(`  - [Bling #${order.numero}] Tag "${TAG_PRONTO_RETIRADA}" já existe. Pulando adição de tag.`);
+        if (success) {
+            console.log(`  - [Bling #${orderIdFromBling}] ✅ SUCESSO: Pedido marcado como PRONTO PARA RETIRADA no Shopify.`);
+            // Adiciona a tag 'retirada-local-pronto' ao pedido no Shopify
+            await addTagToShopifyOrder(shopifyOrder.id, 'retirada-local-pronto');
         } else {
-            console.log(`  - [Bling #${order.numero}] Adicionando tag "${TAG_PRONTO_RETIRADA}"...`);
-            const shopifySuccess = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
-            
-            if (!shopifySuccess) {
-                console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao adicionar tag no Shopify.`);
-                continue;
-            }
-        }
-        
-        // Agora tenta atualizar o Bling
-        console.log(`  - [Bling #${order.numero}] Atualizando Bling para 'Atendido'...`);
-        const STATUS_ATENDIDO_BLING = 9;
-        const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
-        
-        if (blingSuccess) {
-            console.log(`  - ✅ [Bling #${order.numero}] SUCESSO COMPLETO!`);
-        } else {
-            console.error(`  - ❌ [Bling #${order.numero}] ERRO CRÍTICO: Shopify OK, mas FALHA ao atualizar no Bling.`);
-            // Aqui você pode decidir se quer reverter a tag do Shopify ou deixar assim
+            console.log(`  - [Bling #${orderIdFromBling}] ❌ FALHA: Não foi possível marcar o pedido como PRONTO PARA RETIRADA.`);
         }
     }
-    
-    console.log("\n============================== TAREFA FINALIZADA ==============================\n");
+
+    console.log(`
+🎯 RESUMO: Todos os pedidos processados foram marcados como PRONTO PARA RETIRADA`);
+    console.log("============================== TAREFA FINALIZADA ==============================");
 };
 
-// --- ROTA DE TESTE PARA UM PEDIDO ESPECÍFICO ---
-app.get('/test-order/:orderId', async (req, res) => {
-    const { orderId } = req.params;
-    console.log(`\n=== TESTE ESPECÍFICO PARA PEDIDO SHOPIFY: ${orderId} ===`);
-    
-    try {
-        // Busca o pedido no Shopify
-        const shopifyOrder = await findShopifyOrderId(orderId);
-        
-        if (!shopifyOrder) {
-            return res.json({ 
-                error: "Pedido não encontrado no Shopify",
-                orderId: orderId 
-            });
-        }
-        
-        console.log("PEDIDO ENCONTRADO:", JSON.stringify(shopifyOrder, null, 2));
-        
-        // Tenta adicionar a tag
-        const TAG_PRONTO_RETIRADA = "Pronto para Retirada";
-        const result = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
-        
-        // Busca novamente para confirmar
-        const updatedOrder = await findShopifyOrderId(orderId);
-        
-        res.json({
-            success: result,
-            originalOrder: shopifyOrder,
-            updatedOrder: updatedOrder,
-            message: result ? "Tag adicionada com sucesso" : "Falha ao adicionar tag"
-        });
-        
-    } catch (error) {
-        console.error("Erro no teste:", error);
-        res.json({ error: error.message });
-    }
+// Agenda a tarefa para rodar a cada 30 minutos
+cron.schedule('*/30 * * * *', () => {
+    executeTask();
 });
 
-// --- ROTA PARA VERIFICAR PEDIDO ---
-app.get('/check-order/:orderId', async (req, res) => {
-    const { orderId } = req.params;
-    
-    try {
-        const shopifyOrder = await findShopifyOrderId(orderId);
-        res.json({
-            found: !!shopifyOrder,
-            order: shopifyOrder
-        });
-    } catch (error) {
-        res.json({ error: error.message });
-    }
-});
-
-// --- ROTA DE TESTE MANUAL ---
-app.get('/test-process', async (req, res) => {
-    console.log("TESTE MANUAL INICIADO via /test-process");
-    await processOrders();
-    res.send("Teste executado! Verifique os logs no console.");
-});
-
-// --- INICIALIZAÇÃO ---
+// --- INICIALIZAÇÃO DO SERVIDOR ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
-    console.log('Acesse http://localhost:3000/test-process para testar manualmente');
-    
-    // Executa a cada 2 minutos (ao invés de 30 segundos)
-     cron.schedule('*/30 * * * * *',  processOrders);
-    console.log('Tarefa agendada para executar a cada 2 minutos.');
+    console.log("A tarefa agendada para verificar pedidos 'Aguardando Retirada' está ativa.");
+    // Executa a tarefa uma vez ao iniciar para teste imediato
+    executeTask();
 });
