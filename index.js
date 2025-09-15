@@ -263,23 +263,21 @@ const processOrders = async () => {
         console.log(`  - [Bling #${order.numero}] Pedido encontrado no Shopify: ${shopifyOrder.name}`);
         console.log(`  - Tags atuais:`, shopifyOrder.tags);
         
-        // PRINCIPAL: Marca como pronto para retirada (fulfillment)
-        console.log(`  - [Bling #${order.numero}] Marcando como 'Pronto para Retirada'...`);
-        const fulfillmentSuccess = await markOrderReadyForPickup(shopifyOrder.id);
-        
-        // BACKUP: Adiciona tag também
+        // Verifica se a tag já existe
         const TAG_PRONTO_RETIRADA = "Pronto para Retirada";
         const currentTags = shopifyOrder.tags || [];
         
-        let tagSuccess = true;
-        if (!currentTags.includes(TAG_PRONTO_RETIRADA)) {
-            tagSuccess = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
+        if (currentTags.includes(TAG_PRONTO_RETIRADA)) {
+            console.log(`  - [Bling #${order.numero}] Tag "${TAG_PRONTO_RETIRADA}" já existe. Pulando adição de tag.`);
         } else {
-            console.log(`    → Tag "${TAG_PRONTO_RETIRADA}" já existe`);
+            console.log(`  - [Bling #${order.numero}] Adicionando tag "${TAG_PRONTO_RETIRADA}"...`);
+            const shopifySuccess = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
+            
+            if (!shopifySuccess) {
+                console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao adicionar tag no Shopify.`);
+                continue;
+            }
         }
-        
-        // Considera sucesso se pelo menos uma das ações funcionou
-        const shopifySuccess = fulfillmentSuccess || tagSuccess;
         
         // Agora tenta atualizar o Bling
         console.log(`  - [Bling #${order.numero}] Atualizando Bling para 'Atendido'...`);
@@ -315,22 +313,18 @@ app.get('/test-order/:orderId', async (req, res) => {
         
         console.log("PEDIDO ENCONTRADO:", JSON.stringify(shopifyOrder, null, 2));
         
-        // Tenta marcar como pronto para retirada
-        const fulfillmentResult = await markOrderReadyForPickup(shopifyOrder.id);
-        
-        // Adiciona tag como backup
+        // Tenta adicionar a tag
         const TAG_PRONTO_RETIRADA = "Pronto para Retirada";
-        const tagResult = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
+        const result = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
         
         // Busca novamente para confirmar
         const updatedOrder = await findShopifyOrderId(orderId);
         
         res.json({
-            fulfillmentSuccess: fulfillmentResult,
-            tagSuccess: tagResult,
+            success: result,
             originalOrder: shopifyOrder,
             updatedOrder: updatedOrder,
-            message: fulfillmentResult ? "Pedido marcado como pronto para retirada!" : "Falha ao marcar como pronto para retirada"
+            message: result ? "Tag adicionada com sucesso" : "Falha ao adicionar tag"
         });
         
     } catch (error) {
