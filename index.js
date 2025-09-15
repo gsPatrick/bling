@@ -10,7 +10,6 @@ app.use(express.urlencoded({ extended: true }));
 // --- CACHE EM MEMÓRIA PARA O TOKEN ---
 let tokenCache = { token: null };
 
-// Funções para gerenciar o token em memória
 const saveTokenToCache = (tokenData) => {
     tokenCache.token = tokenData.access_token;
     console.log("Token do Bling salvo com sucesso no cache em memória.");
@@ -33,27 +32,17 @@ const getBlingToken = async (code) => {
     } catch (error) { console.error("Erro ao obter token do Bling:", error.response?.data || error.message); throw error; }
 };
 
-// Função para buscar os 100 pedidos mais recentes (vamos filtrar no nosso código)
-const getRecentBlingOrders = async (token) => {
-    const url = 'https://www.bling.com.br/Api/v3/pedidos/vendas';
+const getBlingOrdersWithStatus = async (token, statusId) => {
+    const url = `https://www.bling.com.br/Api/v3/pedidos/vendas?idsSituacoes[]=${statusId}`;
     try {
         const response = await axios.get(url, { headers: { 'Authorization': `Bearer ${token}` } });
         return response.data && response.data.data ? response.data.data : [];
     } catch (error) { console.error("Erro ao buscar pedidos no Bling:", error.response?.data || error.message); return []; }
 };
 
-// Função para encontrar pedido no Shopify (usando o método de busca direto e robusto)
 const findShopifyOrder = async (orderIdFromBling) => {
     const shopifyGid = `gid://shopify/Order/${orderIdFromBling}`;
-    const query = `
-      query getOrderById($id: ID!) {
-        node(id: $id) {
-          ... on Order {
-            id, name, displayFinancialStatus,
-            fulfillmentOrders(first: 10) { edges { node { id, status, requestStatus } } }
-          }
-        }
-      }`;
+    const query = `query getOrderById($id: ID!) { node(id: $id) { ... on Order { id, name, displayFinancialStatus, isArchived, fulfillmentOrders(first: 10) { edges { node { id, status, requestStatus } } } } } }`;
     const variables = { id: shopifyGid };
     try {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query, variables }, { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } });
@@ -63,20 +52,34 @@ const findShopifyOrder = async (orderIdFromBling) => {
     } catch (error) { console.error(`  - ERRO DE CONEXÃO na API Shopify para o ID GID ${shopifyGid}:`, error.message); return null; }
 };
 
+// VERSÃO APRIMORADA: Verifica a resposta para confirmar o sucesso
 const markAsReadyForPickupInShopify = async (fulfillmentOrderId) => {
     const mutation = `mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) { fulfillmentCreateV2(fulfillment: $fulfillment) { fulfillment { id, status }, userErrors { field, message } } }`;
     const variables = { "fulfillment": { "lineItemsByFulfillmentOrder": [{ "fulfillmentOrderId": fulfillmentOrderId }], "notifyCustomer": true } };
     try {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query: mutation, variables }, { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } });
         const userErrors = response.data.data?.fulfillmentCreateV2?.userErrors;
-        if (userErrors && userErrors.length > 0) { console.error(`Erro ao criar fulfillment para ${fulfillmentOrderId} no Shopify:`, userErrors); return false; }
+        if (userErrors && userErrors.length > 0) {
+            console.error(`  - ERRO (userErrors) ao criar fulfillment para ${fulfillmentOrderId} no Shopify:`, userErrors);
+            return false;
+        }
+        // VERIFICAÇÃO ADICIONAL: Garante que um fulfillment foi realmente criado.
+        if (!response.data.data.fulfillmentCreateV2.fulfillment) {
+            console.error(`  - ERRO SILENCIOSO: A API do Shopify não criou o fulfillment (verifique se o pedido está arquivado ou se as permissões estão corretas).`);
+            return false;
+        }
         return true;
     } catch (error) { console.error(`Erro na API ao criar fulfillment ${fulfillmentOrderId}:`, error.response?.data || error.message); return false; }
 };
 
 const updateBlingOrderStatus = async (token, blingOrderId, newStatusId) => {
     try {
-        await axios.put(`https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`, { idSituacao: newStatusId }, { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } });
+        const response = await axios.put(`https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`, { idSituacao: newStatusId }, { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } });
+        // VERIFICAÇÃO ADICIONAL: Loga a resposta para futura depuração.
+        if (response.status !== 200 && response.status !== 204) {
+            console.error(`  - ERRO: Bling retornou status ${response.status} ao tentar atualizar o pedido. Resposta:`, response.data);
+            return false;
+        }
         return true;
     } catch (error) { console.error(`Erro ao atualizar status do pedido ${blingOrderId} no Bling:`, error.response?.data || error.message); return false; }
 };
@@ -96,60 +99,46 @@ app.get('/webhook/bling/callback', async (req, res) => {
 // --- LÓGICA PRINCIPAL ---
 const processOrders = async () => {
     console.log(`\n========================= [${new Date().toISOString()}] =========================`);
-    console.log("INICIANDO TAREFA: Verificação de pedidos.");
-    
+    console.log("INICIANDO TAREFA: Verificação de pedidos 'Aguardando Retirada'.");
     const token = await getTokenFromCache();
     if (!token) { console.log("--> TAREFA ABORTADA: Token do Bling não encontrado."); return; }
 
-    const allRecentBlingOrders = await getRecentBlingOrders(token);
-    if (!allRecentBlingOrders || allRecentBlingOrders.length === 0) {
-        console.log("--> RESULTADO: Nenhum pedido recente foi encontrado no Bling.");
+    const STATUS_AGUARDANDO_RETIRADA = 299240;
+    const blingOrders = await getBlingOrdersWithStatus(token, STATUS_AGUARDANDO_RETIRADA);
+    
+    if (!blingOrders || blingOrders.length === 0) {
+        console.log("--> RESULTADO: Nenhum pedido com status 'Aguardando Retirada' foi encontrado.");
         console.log("============================== TAREFA FINALIZADA ==============================\n");
         return;
     }
 
     const correctShopifyStoreId = parseInt(process.env.SHOPIFY_STORE_ID_IN_BLING, 10);
-    const STATUS_AGUARDANDO_RETIRADA = 299240;
+    console.log(`--> Encontrados ${blingOrders.length} pedido(s) da sua loja para processar.`);
 
-    // FILTRO FINAL E CORRETO, BASEADO NOS DADOS REAIS
-    const ordersToProcess = allRecentBlingOrders.filter(order => 
-        order.situacao && order.situacao.id === STATUS_AGUARDANDO_RETIRADA &&
-        order.loja && order.loja.id === correctShopifyStoreId
-    );
-
-    if (ordersToProcess.length === 0) {
-        console.log(`--> Verificados ${allRecentBlingOrders.length} pedidos. Nenhum 'Aguardando Retirada' da sua loja foi encontrado.`);
-        console.log("============================== TAREFA FINALIZADA ==============================\n");
-        return;
-    }
-    
-    console.log(`--> Encontrados ${ordersToProcess.length} pedido(s) da sua loja para processar:`);
-    console.log("----------------------------------------------------------------------");
-
-    for (const order of ordersToProcess) {
+    for (const order of blingOrders) {
+        if (!order.loja || order.loja.id !== correctShopifyStoreId) continue;
         const blingOrderId = order.id;
         const shopifyOrderId = order.numeroLoja;
 
-        if (!shopifyOrderId) {
-            console.warn(`- [Bling #${order.numero}] PULANDO: não possui 'numeroLoja' (ID do Shopify).`);
-            continue;
-        }
+        if (!shopifyOrderId) { console.warn(`- [Bling #${order.numero}] PULANDO: não possui 'numeroLoja'.`); continue; }
 
         console.log(`- [Bling #${order.numero}] Processando... Buscando no Shopify pelo ID: ${shopifyOrderId}`);
         const shopifyOrder = await findShopifyOrder(shopifyOrderId);
 
-        if (!shopifyOrder) {
-            console.warn(`  - [Bling #${order.numero}] AVISO: Pedido não encontrado no Shopify. Verifique se o ID ${shopifyOrderId} está correto no Bling.`);
+        if (!shopifyOrder) { console.warn(`  - [Bling #${order.numero}] AVISO: Pedido não encontrado no Shopify.`); continue; }
+        
+        console.log(`  - [Bling #${order.numero}] Pedido encontrado (Arquivado: ${shopifyOrder.isArchived}).`);
+
+        if (shopifyOrder.isArchived) {
+            console.warn(`  - [Bling #${order.numero}] AVISO: Pedido está ARQUIVADO no Shopify e não pode ser modificado. Desarquive-o manualmente para processar.`);
             continue;
         }
-        
-        console.log(`  - [Bling #${order.numero}] Pedido encontrado no Shopify (Status Financeiro: ${shopifyOrder.displayFinancialStatus}).`);
 
         let wasProcessed = false;
         for (const fo of shopifyOrder.fulfillmentOrders.edges) {
             if (fo.node.status === 'OPEN' && fo.node.requestStatus === 'UNSUBMITTED') {
-                wasProcessed = true; // Marca que encontramos uma ação a ser feita.
-                console.log(`  - [Bling #${order.numero}] Fulfillment Order (${fo.node.id}) está pronto para retirada. Atualizando Shopify...`);
+                wasProcessed = true;
+                console.log(`  - [Bling #${order.numero}] Fulfillment Order (${fo.node.id}) está pronto. Atualizando Shopify...`);
                 const shopifySuccess = await markAsReadyForPickupInShopify(fo.node.id);
                 
                 if (shopifySuccess) {
@@ -157,18 +146,16 @@ const processOrders = async () => {
                     const STATUS_ATENDIDO_BLING = 9;
                     const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
                     if (blingSuccess) {
-                        console.log(`  - ✅ [Bling #${order.numero}] SUCESSO COMPLETO! Pedido atualizado para 'Atendido' no Bling.`);
+                        console.log(`  - ✅ [Bling #${order.numero}] SUCESSO COMPLETO!`);
                     } else {
-                        console.error(`  - ❌ [Bling #${order.numero}] ERRO CRÍTICO: Shopify OK, mas FALHA ao atualizar status no Bling.`);
+                        console.error(`  - ❌ [Bling #${order.numero}] ERRO CRÍTICO: Shopify OK, mas FALHA ao atualizar no Bling.`);
                     }
                 } else {
                     console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao marcar como pronto no Shopify.`);
                 }
             }
         }
-        if (!wasProcessed) {
-             console.log(`  - [Bling #${order.numero}] Nenhuma ação necessária no Shopify (pedido já processado ou sem itens para retirada).`);
-        }
+        if (!wasProcessed) console.log(`  - [Bling #${order.numero}] Nenhuma ação necessária (pedido já processado).`);
     }
     console.log("============================== TAREFA FINALIZADA ==============================\n");
 };
@@ -176,7 +163,7 @@ const processOrders = async () => {
 // --- INICIALIZAÇÃO ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-     cron.schedule('*/30 * * * * *', processOrders);
+    cron.schedule('*/30 * * * * *', processOrders);
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log('Tarefa agendada para executar a cada 2 minutos.');
 });
