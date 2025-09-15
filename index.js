@@ -52,7 +52,6 @@ const findShopifyOrder = async (orderIdFromBling) => {
     } catch (error) { console.error(`  - ERRO DE CONEXÃO na API Shopify para o ID GID ${shopifyGid}:`, error.message); return null; }
 };
 
-// VERSÃO APRIMORADA: Verifica a resposta para confirmar o sucesso
 const markAsReadyForPickupInShopify = async (fulfillmentOrderId) => {
     const mutation = `mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) { fulfillmentCreateV2(fulfillment: $fulfillment) { fulfillment { id, status }, userErrors { field, message } } }`;
     const variables = { "fulfillment": { "lineItemsByFulfillmentOrder": [{ "fulfillmentOrderId": fulfillmentOrderId }], "notifyCustomer": true } };
@@ -60,12 +59,11 @@ const markAsReadyForPickupInShopify = async (fulfillmentOrderId) => {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query: mutation, variables }, { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } });
         const userErrors = response.data.data?.fulfillmentCreateV2?.userErrors;
         if (userErrors && userErrors.length > 0) {
-            console.error(`  - ERRO (userErrors) ao criar fulfillment para ${fulfillmentOrderId} no Shopify:`, userErrors);
+            console.error(`  - ERRO (userErrors) ao criar fulfillment no Shopify:`, userErrors);
             return false;
         }
-        // VERIFICAÇÃO ADICIONAL: Garante que um fulfillment foi realmente criado.
         if (!response.data.data.fulfillmentCreateV2.fulfillment) {
-            console.error(`  - ERRO SILENCIOSO: A API do Shopify não criou o fulfillment (verifique se o pedido está arquivado ou se as permissões estão corretas).`);
+            console.error(`  - ERRO SILENCIOSO: A API do Shopify não criou o fulfillment (verifique se o pedido está arquivado).`);
             return false;
         }
         return true;
@@ -75,9 +73,8 @@ const markAsReadyForPickupInShopify = async (fulfillmentOrderId) => {
 const updateBlingOrderStatus = async (token, blingOrderId, newStatusId) => {
     try {
         const response = await axios.put(`https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`, { idSituacao: newStatusId }, { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } });
-        // VERIFICAÇÃO ADICIONAL: Loga a resposta para futura depuração.
         if (response.status !== 200 && response.status !== 204) {
-            console.error(`  - ERRO: Bling retornou status ${response.status} ao tentar atualizar o pedido. Resposta:`, response.data);
+            console.error(`  - ERRO: Bling retornou status ${response.status}.`);
             return false;
         }
         return true;
@@ -130,15 +127,19 @@ const processOrders = async () => {
         console.log(`  - [Bling #${order.numero}] Pedido encontrado (Arquivado: ${shopifyOrder.isArchived}).`);
 
         if (shopifyOrder.isArchived) {
-            console.warn(`  - [Bling #${order.numero}] AVISO: Pedido está ARQUIVADO no Shopify e não pode ser modificado. Desarquive-o manualmente para processar.`);
-            continue;
+            console.warn(`  - [Bling #${order.numero}] AVISO: Pedido está ARQUIVADO no Shopify. Modificações podem falhar. Desarquive-o para garantir o funcionamento.`);
+            // O código continua mesmo se estiver arquivado, para seguir a sua regra.
         }
 
         let wasProcessed = false;
         for (const fo of shopifyOrder.fulfillmentOrders.edges) {
-            if (fo.node.status === 'OPEN' && fo.node.requestStatus === 'UNSUBMITTED') {
+            // ==================================================================
+            // MUDANÇA CRÍTICA: AGORA A CONDIÇÃO É MUITO MAIS SIMPLES
+            // Se a ordem de fulfillment não estiver fechada ou cancelada, nós agimos.
+            // ==================================================================
+            if (fo.node.status !== 'CLOSED' && fo.node.status !== 'CANCELLED') {
                 wasProcessed = true;
-                console.log(`  - [Bling #${order.numero}] Fulfillment Order (${fo.node.id}) está pronto. Atualizando Shopify...`);
+                console.log(`  - [Bling #${order.numero}] AÇÃO: Forçando atualização do Fulfillment Order (${fo.node.id}) que está com status '${fo.node.status}'.`);
                 const shopifySuccess = await markAsReadyForPickupInShopify(fo.node.id);
                 
                 if (shopifySuccess) {
@@ -153,9 +154,11 @@ const processOrders = async () => {
                 } else {
                     console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao marcar como pronto no Shopify.`);
                 }
+                // Paramos o loop interno pois já agimos no fulfillment que precisava.
+                break; 
             }
         }
-        if (!wasProcessed) console.log(`  - [Bling #${order.numero}] Nenhuma ação necessária (pedido já processado).`);
+        if (!wasProcessed) console.log(`  - [Bling #${order.numero}] Nenhuma ação necessária (todos os fulfillments já estão fechados/cancelados).`);
     }
     console.log("============================== TAREFA FINALIZADA ==============================\n");
 };
