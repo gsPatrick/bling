@@ -169,9 +169,33 @@ const updateBlingOrderStatus = async (token, blingOrderId, newStatusId) => {
     console.log(`    → Tentando atualizar pedido ${blingOrderId} para status ${newStatusId} no Bling`);
     
     try {
-        const response = await axios.put(
-            `https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`, 
-            { idSituacao: newStatusId }, 
+        // Primeiro, busca os dados completos do pedido
+        const getResponse = await axios.get(
+            `https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`,
+            { 
+                headers: { 
+                    'Authorization': `Bearer ${token}` 
+                } 
+            }
+        );
+        
+        if (!getResponse.data || !getResponse.data.data) {
+            console.error(`    → Erro ao buscar dados do pedido ${blingOrderId}`);
+            return false;
+        }
+        
+        const orderData = getResponse.data.data;
+        console.log(`    → Dados atuais do pedido: Status atual = ${orderData.situacao?.id}`);
+        
+        // Prepara dados mínimos necessários para a atualização
+        const updateData = {
+            idSituacao: newStatusId
+        };
+        
+        // Tenta usar o endpoint de alteração de situação específico
+        const alteracaoResponse = await axios.put(
+            `https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}/situacoes`,
+            updateData,
             { 
                 headers: { 
                     'Authorization': `Bearer ${token}`, 
@@ -182,15 +206,36 @@ const updateBlingOrderStatus = async (token, blingOrderId, newStatusId) => {
         
         console.log(`    → SUCESSO! Pedido ${blingOrderId} atualizado no Bling`);
         return true;
+        
     } catch (error) { 
         console.error(`    → ERRO DETALHADO ao atualizar pedido ${blingOrderId} no Bling:`);
         console.error(`    → Status HTTP:`, error.response?.status);
+        console.error(`    → URL tentada:`, error.config?.url);
         console.error(`    → Dados do erro:`, JSON.stringify(error.response?.data, null, 2));
         
-        // Verifica se é erro de validação específico
-        if (error.response?.data?.error?.type === 'VALIDATION_ERROR') {
-            const fields = error.response.data.error.fields || [];
-            console.error(`    → Campos com erro:`, fields.map(f => `${f.field}: ${f.message}`).join(', '));
+        // Se o endpoint específico falhar, tenta o endpoint genérico com dados mínimos
+        if (error.response?.status === 404 || error.response?.status === 405) {
+            console.log(`    → Tentando endpoint alternativo...`);
+            
+            try {
+                const alternativeResponse = await axios.patch(
+                    `https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`,
+                    { situacao: { id: newStatusId } },
+                    { 
+                        headers: { 
+                            'Authorization': `Bearer ${token}`, 
+                            'Content-Type': 'application/json' 
+                        } 
+                    }
+                );
+                
+                console.log(`    → SUCESSO com endpoint alternativo!`);
+                return true;
+                
+            } catch (altError) {
+                console.error(`    → Endpoint alternativo também falhou:`, altError.response?.data);
+                return false;
+            }
         }
         
         return false; 
@@ -264,7 +309,7 @@ const processOrders = async () => {
         console.log(`  - Tags atuais:`, shopifyOrder.tags);
         
         // PRINCIPAL: Marca como pronto para retirada (fulfillment)
-        console.log(`  - [Bling #${order.numero}] Marcando como 'Pronto para Retirada'...`);
+        console.log(`  - [Bling #${order.numero}] Marcando como 'Pronto para Retirada' (fulfillment)...`);
         const fulfillmentSuccess = await markOrderReadyForPickup(shopifyOrder.id);
         
         // BACKUP: Adiciona tag também
@@ -273,6 +318,7 @@ const processOrders = async () => {
         
         let tagSuccess = true;
         if (!currentTags.includes(TAG_PRONTO_RETIRADA)) {
+            console.log(`  - [Bling #${order.numero}] Adicionando tag "${TAG_PRONTO_RETIRADA}" como backup...`);
             tagSuccess = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
         } else {
             console.log(`    → Tag "${TAG_PRONTO_RETIRADA}" já existe`);
@@ -280,6 +326,17 @@ const processOrders = async () => {
         
         // Considera sucesso se pelo menos uma das ações funcionou
         const shopifySuccess = fulfillmentSuccess || tagSuccess;
+        
+        if (!shopifySuccess) {
+            console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha tanto no fulfillment quanto na tag do Shopify.`);
+            continue;
+        }
+        
+        if (fulfillmentSuccess) {
+            console.log(`  - ✅ [Bling #${order.numero}] SUCESSO no fulfillment do Shopify!`);
+        } else {
+            console.log(`  - ⚠️ [Bling #${order.numero}] Fulfillment falhou, mas tag foi adicionada.`);
+        }
         
         // Agora tenta atualizar o Bling
         console.log(`  - [Bling #${order.numero}] Atualizando Bling para 'Atendido'...`);
@@ -368,6 +425,6 @@ app.listen(PORT, () => {
     console.log('Acesse http://localhost:3000/test-process para testar manualmente');
     
     // Executa a cada 2 minutos (ao invés de 30 segundos)
-     cron.schedule('*/30 * * * * *',  processOrders);
+    cron.schedule('*/30 * * * * *',processOrders);
     console.log('Tarefa agendada para executar a cada 2 minutos.');
 });
