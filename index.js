@@ -40,13 +40,31 @@ const getBlingOrdersWithStatus = async (token, statusId) => {
     } catch (error) { console.error("Erro ao buscar pedidos no Bling:", error.response?.data || error.message); return []; }
 };
 
+// VERSÃO CORRIGIDA: Removido o campo 'isArchived' da query
 const findShopifyOrder = async (orderIdFromBling) => {
     const shopifyGid = `gid://shopify/Order/${orderIdFromBling}`;
-    const query = `query getOrderById($id: ID!) { node(id: $id) { ... on Order { id, name, displayFinancialStatus, isArchived, fulfillmentOrders(first: 10) { edges { node { id, status, requestStatus } } } } } }`;
+    const query = `
+      query getOrderById($id: ID!) {
+        node(id: $id) {
+          ... on Order {
+            id
+            name
+            displayFinancialStatus
+            fulfillmentOrders(first: 10) {
+              edges {
+                node { id, status, requestStatus }
+              }
+            }
+          }
+        }
+      }`;
     const variables = { id: shopifyGid };
     try {
         const response = await axios.post(process.env.SHOPIFY_API_URL, { query, variables }, { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } });
-        if (response.data.errors) { console.error(`  - ERRO DE QUERY GRAPHQL para o ID GID ${shopifyGid}:`, response.data.errors); return null; }
+        if (response.data.errors) {
+            console.error(`  - ERRO DE QUERY GRAPHQL para o ID GID ${shopifyGid}:`, response.data.errors);
+            return null;
+        }
         const orderNode = response.data.data.node;
         return (orderNode && orderNode.id) ? orderNode : null;
     } catch (error) { console.error(`  - ERRO DE CONEXÃO na API Shopify para o ID GID ${shopifyGid}:`, error.message); return null; }
@@ -124,19 +142,10 @@ const processOrders = async () => {
 
         if (!shopifyOrder) { console.warn(`  - [Bling #${order.numero}] AVISO: Pedido não encontrado no Shopify.`); continue; }
         
-        console.log(`  - [Bling #${order.numero}] Pedido encontrado (Arquivado: ${shopifyOrder.isArchived}).`);
-
-        if (shopifyOrder.isArchived) {
-            console.warn(`  - [Bling #${order.numero}] AVISO: Pedido está ARQUIVADO no Shopify. Modificações podem falhar. Desarquive-o para garantir o funcionamento.`);
-            // O código continua mesmo se estiver arquivado, para seguir a sua regra.
-        }
-
+        console.log(`  - [Bling #${order.numero}] Pedido encontrado (Status Financeiro: ${shopifyOrder.displayFinancialStatus}).`);
+        
         let wasProcessed = false;
         for (const fo of shopifyOrder.fulfillmentOrders.edges) {
-            // ==================================================================
-            // MUDANÇA CRÍTICA: AGORA A CONDIÇÃO É MUITO MAIS SIMPLES
-            // Se a ordem de fulfillment não estiver fechada ou cancelada, nós agimos.
-            // ==================================================================
             if (fo.node.status !== 'CLOSED' && fo.node.status !== 'CANCELLED') {
                 wasProcessed = true;
                 console.log(`  - [Bling #${order.numero}] AÇÃO: Forçando atualização do Fulfillment Order (${fo.node.id}) que está com status '${fo.node.status}'.`);
@@ -154,7 +163,6 @@ const processOrders = async () => {
                 } else {
                     console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao marcar como pronto no Shopify.`);
                 }
-                // Paramos o loop interno pois já agimos no fulfillment que precisava.
                 break; 
             }
         }
