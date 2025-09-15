@@ -69,6 +69,16 @@ const findShopifyOrderId = async (orderIdFromBling) => {
                     id
                     name
                     tags
+                    displayFulfillmentStatus
+                    fulfillmentStatus
+                    displayFinancialStatus
+                    lineItems(first: 5) {
+                        nodes {
+                            id
+                            title
+                            fulfillmentStatus
+                        }
+                    }
                 } 
             } 
         }`;
@@ -253,21 +263,23 @@ const processOrders = async () => {
         console.log(`  - [Bling #${order.numero}] Pedido encontrado no Shopify: ${shopifyOrder.name}`);
         console.log(`  - Tags atuais:`, shopifyOrder.tags);
         
-        // Verifica se a tag já existe
+        // PRINCIPAL: Marca como pronto para retirada (fulfillment)
+        console.log(`  - [Bling #${order.numero}] Marcando como 'Pronto para Retirada'...`);
+        const fulfillmentSuccess = await markOrderReadyForPickup(shopifyOrder.id);
+        
+        // BACKUP: Adiciona tag também
         const TAG_PRONTO_RETIRADA = "Pronto para Retirada";
         const currentTags = shopifyOrder.tags || [];
         
-        if (currentTags.includes(TAG_PRONTO_RETIRADA)) {
-            console.log(`  - [Bling #${order.numero}] Tag "${TAG_PRONTO_RETIRADA}" já existe. Pulando adição de tag.`);
+        let tagSuccess = true;
+        if (!currentTags.includes(TAG_PRONTO_RETIRADA)) {
+            tagSuccess = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
         } else {
-            console.log(`  - [Bling #${order.numero}] Adicionando tag "${TAG_PRONTO_RETIRADA}"...`);
-            const shopifySuccess = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
-            
-            if (!shopifySuccess) {
-                console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao adicionar tag no Shopify.`);
-                continue;
-            }
+            console.log(`    → Tag "${TAG_PRONTO_RETIRADA}" já existe`);
         }
+        
+        // Considera sucesso se pelo menos uma das ações funcionou
+        const shopifySuccess = fulfillmentSuccess || tagSuccess;
         
         // Agora tenta atualizar o Bling
         console.log(`  - [Bling #${order.numero}] Atualizando Bling para 'Atendido'...`);
@@ -285,6 +297,63 @@ const processOrders = async () => {
     console.log("\n============================== TAREFA FINALIZADA ==============================\n");
 };
 
+// --- ROTA DE TESTE PARA UM PEDIDO ESPECÍFICO ---
+app.get('/test-order/:orderId', async (req, res) => {
+    const { orderId } = req.params;
+    console.log(`\n=== TESTE ESPECÍFICO PARA PEDIDO SHOPIFY: ${orderId} ===`);
+    
+    try {
+        // Busca o pedido no Shopify
+        const shopifyOrder = await findShopifyOrderId(orderId);
+        
+        if (!shopifyOrder) {
+            return res.json({ 
+                error: "Pedido não encontrado no Shopify",
+                orderId: orderId 
+            });
+        }
+        
+        console.log("PEDIDO ENCONTRADO:", JSON.stringify(shopifyOrder, null, 2));
+        
+        // Tenta marcar como pronto para retirada
+        const fulfillmentResult = await markOrderReadyForPickup(shopifyOrder.id);
+        
+        // Adiciona tag como backup
+        const TAG_PRONTO_RETIRADA = "Pronto para Retirada";
+        const tagResult = await addTagToShopifyOrder(shopifyOrder.id, TAG_PRONTO_RETIRADA);
+        
+        // Busca novamente para confirmar
+        const updatedOrder = await findShopifyOrderId(orderId);
+        
+        res.json({
+            fulfillmentSuccess: fulfillmentResult,
+            tagSuccess: tagResult,
+            originalOrder: shopifyOrder,
+            updatedOrder: updatedOrder,
+            message: fulfillmentResult ? "Pedido marcado como pronto para retirada!" : "Falha ao marcar como pronto para retirada"
+        });
+        
+    } catch (error) {
+        console.error("Erro no teste:", error);
+        res.json({ error: error.message });
+    }
+});
+
+// --- ROTA PARA VERIFICAR PEDIDO ---
+app.get('/check-order/:orderId', async (req, res) => {
+    const { orderId } = req.params;
+    
+    try {
+        const shopifyOrder = await findShopifyOrderId(orderId);
+        res.json({
+            found: !!shopifyOrder,
+            order: shopifyOrder
+        });
+    } catch (error) {
+        res.json({ error: error.message });
+    }
+});
+
 // --- ROTA DE TESTE MANUAL ---
 app.get('/test-process', async (req, res) => {
     console.log("TESTE MANUAL INICIADO via /test-process");
@@ -299,6 +368,6 @@ app.listen(PORT, () => {
     console.log('Acesse http://localhost:3000/test-process para testar manualmente');
     
     // Executa a cada 2 minutos (ao invés de 30 segundos)
-    cron.schedule('*/30 * * * * *',  processOrders);
+     cron.schedule('*/30 * * * * *',  processOrders);
     console.log('Tarefa agendada para executar a cada 2 minutos.');
 });
