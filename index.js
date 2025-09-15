@@ -1,6 +1,4 @@
 
-
-
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -85,7 +83,6 @@ const findShopifyOrderId = async (orderIdFromBling) => {
                     id
                     name
                     tags
-                    displayFulfillmentStatus
                     displayFinancialStatus
                     createdAt
                     lineItems(first: 50) {
@@ -138,7 +135,7 @@ const findShopifyOrderId = async (orderIdFromBling) => {
         });
         
         if (response.data.errors) { 
-            console.error(`  - ERRO DE QUERY GRAPHQL para o ID GID ${shopifyGid}:`, response.data.errors); 
+            console.error(`  - ERRO DE QUERY GRAPHQL para o ID GID ${shopifyGid}:`, JSON.stringify(response.data.errors, null, 2)); 
             return null; 
         }
         
@@ -381,7 +378,6 @@ const markOrderReadyForPickup = async (shopifyOrder) => {
     console.log(`    → OBJETIVO: Marcar pedido ${shopifyOrder.name} como PRONTO PARA RETIRADA`);
     
     const fulfillmentOrders = shopifyOrder.fulfillmentOrders?.nodes || [];
-    console.log(`    → Status atual: ${shopifyOrder.displayFulfillmentStatus}`);
     console.log(`    → Fulfillment Orders encontrados: ${fulfillmentOrders.length}`);
     
     if (fulfillmentOrders.length === 0) {
@@ -418,7 +414,7 @@ const markOrderReadyForPickup = async (shopifyOrder) => {
 
 // FUNÇÃO CORRIGIDA: Adiciona uma tag ao pedido
 const addTagToShopifyOrder = async (shopifyGid, tag) => {
-    console.log(`    → Tentando adicionar tag "${tag}" ao pedido ${shopifyGid}`);
+    console.log(`    → Tentando adicionar tag \"${tag}\" ao pedido ${shopifyGid}`);
     
     const mutation = `
         mutation tagsAdd($id: ID!, $tags: [String!]!) { 
@@ -447,9 +443,9 @@ const addTagToShopifyOrder = async (shopifyGid, tag) => {
             } 
         });
         
-        if (response.data.errors) { 
-            console.error(`    → ERRO DE GRAPHQL ao adicionar tag:`, response.data.errors); 
-            return false; 
+        if (response.data.errors) {
+            console.error(`    → ERRO DE GRAPHQL ao adicionar tag:`, response.data.errors);
+            return false;
         }
         
         const result = response.data.data?.tagsAdd;
@@ -460,112 +456,102 @@ const addTagToShopifyOrder = async (shopifyGid, tag) => {
             return false;
         }
         
-        console.log(`    → ✅ SUCESSO! Tag "${tag}" adicionada ao pedido`);
+        console.log(`    → ✅ SUCESSO: Tag \"${tag}\" adicionada ao pedido ${shopifyGid}`);
         return true;
         
-    } catch (error) { 
-        console.error(`    → ERRO DE CONEXÃO ao adicionar tag:`, error.response?.data || error.message); 
-        return false; 
+    } catch (error) {
+        console.error(`    → ERRO DE CONEXÃO ao adicionar tag:`, error.message);
+        return false;
     }
 };
 
 // --- ROTAS DA API ---
 
-// Rota para iniciar o processo de autorização do Bling
-app.get('/webhook/bling/auth', (req, res) => {
-    const authUrl = `https://bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${process.env.BLING_CLIENT_ID}&state=loja_amouh`;
-    res.redirect(authUrl);
+app.get("/", (req, res) => {
+    res.send("Joyce API está no ar!");
 });
 
-// Rota de callback para o Bling
-app.get('/webhook/bling/callback', async (req, res) => {
+app.get("/webhook/bling/callback", async (req, res) => {
     const { code, state } = req.query;
-    if (!code) return res.status(400).send("Erro: Código de autorização não encontrado.");
+    if (!code) return res.status(400).send("Código de autorização não encontrado.");
     
     try {
         const tokenData = await getBlingToken(code);
         await saveTokenToCache(tokenData);
-        res.send("Autorização com Bling concluída com sucesso! O token foi salvo.");
+        res.send("Autorização com Bling bem-sucedida! O token foi salvo.");
     } catch (error) {
         res.status(500).send("Falha ao obter ou salvar o token do Bling.");
     }
 });
 
-// Rota para testar a busca de pedidos (para debug)
-app.get('/test/orders', async (req, res) => {
-    const token = await getTokenFromCache();
-    if (!token) return res.status(401).send("Token do Bling não encontrado. Autorize primeiro.");
-    
-    const statusId = 204574266; // ID para "Aguardando Retirada"
-    const orders = await getBlingOrdersWithStatus(token, statusId);
-    res.json(orders);
-});
-
 // --- TAREFAS AGENDADAS (CRON) ---
 
-// Função principal que executa a lógica de negócio
-const executeTask = async () => {
-    console.log(`
-========================= [${new Date().toISOString()}] =========================`);
-    console.log("🎯 OBJETIVO: Marcar pedidos como PRONTO PARA RETIRADA");
-    console.log("INICIANDO TAREFA: Verificação de pedidos 'Aguardando Retirada'.");
+const SITUACAO_AGUARDANDO_RETIRADA = 214875; // ID da situação no Bling
 
+const checkOrdersAndProcess = async () => {
+    console.log(`\n========================= [${new Date().toISOString()}] =========================`);
+    console.log("INICIANDO TAREFA: Verificação de pedidos 'Aguardando Retirada'.");
+    
     const token = await getTokenFromCache();
     if (!token) {
-        console.error("FALHA CRÍTICA: Token do Bling não encontrado. A tarefa não pode continuar.");
+        console.error("ERRO CRÍTICO: Token do Bling não encontrado. A tarefa não pode continuar.");
         return;
     }
-
-    const statusId = process.env.SHOPIFY_STORE_ID_IN_BLING; // ID para "Aguardando Retirada"
-    const blingOrders = await getBlingOrdersWithStatus(token, statusId);
-
-    if (blingOrders.length === 0) {
+    
+    const orders = await getBlingOrdersWithStatus(token, SITUACAO_AGUARDANDO_RETIRADA);
+    
+    if (orders.length === 0) {
         console.log("--> Nenhum pedido 'Aguardando Retirada' encontrado.");
-        console.log("============================== TAREFA FINALIZADA ==============================");
         return;
     }
-
-    console.log(`--> Encontrados ${blingOrders.length} pedido(s) da sua loja para processar.`);
-
-    for (const blingOrder of blingOrders) {
-        const orderIdFromBling = blingOrder.id;
-        console.log(`
-🔄 [Bling #${orderIdFromBling}] Processando...`);
-
-        const shopifyOrder = await findShopifyOrderId(orderIdFromBling);
-
-        if (!shopifyOrder) {
-            console.log(`  - [Bling #${orderIdFromBling}] AVISO: Pedido não encontrado no Shopify.`);
+    
+    console.log(`--> Encontrados ${orders.length} pedido(s) da sua loja para processar.`);
+    
+    for (const order of orders) {
+        const orderIdFromBling = order.loja?.idLojaProduto || order.numero;
+        console.log(`\n- [Bling #${order.numero}] Processando... Buscando no Shopify pelo ID: ${orderIdFromBling}`);
+        
+        if (!orderIdFromBling) {
+            console.warn(`  - [Bling #${order.numero}] AVISO: Não foi possível encontrar o ID do pedido da loja.`);
             continue;
         }
-
-        // Tenta marcar o pedido como pronto para retirada
-        const success = await markOrderReadyForPickup(shopifyOrder);
-
-        if (success) {
-            console.log(`  - [Bling #${orderIdFromBling}] ✅ SUCESSO: Pedido marcado como PRONTO PARA RETIRADA no Shopify.`);
-            // Adiciona a tag 'retirada-local-pronto' ao pedido no Shopify
+        
+        const shopifyOrder = await findShopifyOrderId(orderIdFromBling);
+        
+        if (!shopifyOrder) {
+            console.warn(`  - [Bling #${order.numero}] AVISO: Pedido não encontrado no Shopify.`);
+            continue;
+        }
+        
+        // Verifica se a tag 'retirada-local-pronto' já existe
+        if (shopifyOrder.tags && shopifyOrder.tags.includes('retirada-local-pronto')) {
+            console.log(`  - [Bling #${order.numero}] AVISO: Pedido já marcado como 'Pronto para Retirada'. Pulando.`);
+            continue;
+        }
+        
+        // Marca o pedido como pronto para retirada
+        const readyForPickupResult = await markOrderReadyForPickup(shopifyOrder);
+        
+        if (readyForPickupResult) {
+            console.log(`  - [Bling #${order.numero}] ✅ SUCESSO: Pedido marcado como 'Pronto para Retirada' no Shopify.`);
+            
+            // Adiciona a tag para evitar reprocessamento
             await addTagToShopifyOrder(shopifyOrder.id, 'retirada-local-pronto');
         } else {
-            console.log(`  - [Bling #${orderIdFromBling}] ❌ FALHA: Não foi possível marcar o pedido como PRONTO PARA RETIRADA.`);
+            console.error(`  - [Bling #${order.numero}] ❌ FALHA: Não foi possível marcar o pedido como 'Pronto para Retirada'.`);
         }
     }
-
-    console.log(`
-🎯 RESUMO: Todos os pedidos processados foram marcados como PRONTO PARA RETIRADA`);
-    console.log("============================== TAREFA FINALIZADA ==============================");
 };
 
-// Agenda a tarefa para rodar a cada 30 minutos
-cron.schedule('*/30 * * * *', () => {
-    executeTask();
-});
+// Agenda a tarefa para rodar a cada 5 minutos
+cron.schedule("*/30 * * * * *", checkOrdersAndProcess);
+
 
 // --- INICIALIZAÇÃO DO SERVIDOR ---
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log("A tarefa agendada para verificar pedidos 'Aguardando Retirada' está ativa.");
-    // Executa a tarefa uma vez ao iniciar para teste imediato
-    executeTask();
+    checkOrdersAndProcess(); // Executa a tarefa uma vez ao iniciar
 });
