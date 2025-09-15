@@ -354,6 +354,30 @@ const processOrders = async () => {
     console.log("\n============================== TAREFA FINALIZADA ==============================\n");
 };
 
+// --- ROTA ESPECÍFICA PARA TESTAR FULFILLMENT ---
+app.get('/test-fulfillment/:orderId', async (req, res) => {
+    const { orderId } = req.params;
+    console.log(`\n=== TESTE DE FULFILLMENT PARA PEDIDO: ${orderId} ===`);
+    
+    try {
+        const shopifyGid = `gid://shopify/Order/${orderId}`;
+        
+        // Testa apenas o fulfillment
+        const fulfillmentResult = await markOrderReadyForPickup(shopifyGid);
+        
+        res.json({
+            orderId: orderId,
+            shopifyGid: shopifyGid,
+            fulfillmentSuccess: fulfillmentResult,
+            message: fulfillmentResult ? "SUCESSO: Pedido marcado como pronto para retirada!" : "ERRO: Falha ao marcar como pronto para retirada"
+        });
+        
+    } catch (error) {
+        console.error("Erro no teste de fulfillment:", error);
+        res.json({ error: error.message });
+    }
+});
+
 // --- ROTA DE TESTE PARA UM PEDIDO ESPECÍFICO ---
 app.get('/test-order/:orderId', async (req, res) => {
     const { orderId } = req.params;
@@ -425,6 +449,6 @@ app.listen(PORT, () => {
     console.log('Acesse http://localhost:3000/test-process para testar manualmente');
     
     // Executa a cada 2 minutos (ao invés de 30 segundos)
-    cron.schedule('*/30 * * * * *',processOrders);
+    cron.schedule('*/30 * * * * *', processOrders);
     console.log('Tarefa agendada para executar a cada 2 minutos.');
 });
