@@ -96,50 +96,116 @@ const findShopifyOrderWithFulfillments = async (orderIdFromBling) => {
     }
 };
 
-// NOVA FUNÇÃO: Cria fulfillment order para pickup quando necessário
-const createPickupFulfillmentOrder = async (orderId) => {
-    const mutation = `
-        mutation fulfillmentOrderMarkAsLocal($orderId: ID!) {
-            fulfillmentOrderMarkAsLocal(orderId: $orderId) {
-                fulfillmentOrders {
+// NOVA FUNÇÃO: Cria um fulfillment para pickup (quando o pedido está UNFULFILLED)
+const createPickupFulfillment = async (orderId) => {
+    // Primeiro, vamos buscar os line items do pedido
+    const orderQuery = `
+        query getOrderLineItems($id: ID!) {
+            node(id: $id) {
+                ... on Order {
                     id
-                    status
-                    deliveryMethod {
-                        methodType
+                    lineItems(first: 50) {
+                        edges {
+                            node {
+                                id
+                                quantity
+                                fulfillableQuantity
+                            }
+                        }
                     }
-                }
-                userErrors {
-                    field
-                    message
                 }
             }
         }
     `;
-    const variables = { orderId };
+    
     try {
-        const response = await axios.post(process.env.SHOPIFY_API_URL, { query: mutation, variables }, { 
+        const orderResponse = await axios.post(process.env.SHOPIFY_API_URL, { 
+            query: orderQuery, 
+            variables: { id: orderId } 
+        }, { 
             headers: { 
                 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 
                 'Content-Type': 'application/json' 
             } 
         });
         
-        if (response.data.errors) {
-            console.error(`  - ERRO DE MUTATION GRAPHQL para criar fulfillment local ${orderId}:`, response.data.errors);
-            return null;
+        if (orderResponse.data.errors) {
+            console.error(`  - ERRO ao buscar line items do pedido ${orderId}:`, orderResponse.data.errors);
+            return false;
         }
 
-        const userErrors = response.data.data?.fulfillmentOrderMarkAsLocal?.userErrors;
+        const lineItems = orderResponse.data.data.node.lineItems.edges;
+        if (!lineItems || lineItems.length === 0) {
+            console.error(`  - ERRO: Nenhum line item encontrado no pedido ${orderId}`);
+            return false;
+        }
+
+        // Prepara os line items para fulfillment
+        const lineItemsToFulfill = lineItems
+            .filter(edge => edge.node.fulfillableQuantity > 0)
+            .map(edge => ({
+                id: edge.node.id,
+                quantity: edge.node.fulfillableQuantity
+            }));
+
+        if (lineItemsToFulfill.length === 0) {
+            console.log(`  - AVISO: Nenhum item fulfillable no pedido ${orderId}`);
+            return false;
+        }
+
+        // Cria o fulfillment
+        const fulfillmentMutation = `
+            mutation fulfillmentCreate($fulfillment: FulfillmentInput!) {
+                fulfillmentCreate(fulfillment: $fulfillment) {
+                    fulfillment {
+                        id
+                        status
+                    }
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }
+        `;
+
+        const fulfillmentVariables = {
+            fulfillment: {
+                lineItems: lineItemsToFulfill,
+                notifyCustomer: false,
+                trackingInfo: {
+                    company: "Pickup Local",
+                    number: "READY_FOR_PICKUP"
+                }
+            }
+        };
+
+        const fulfillmentResponse = await axios.post(process.env.SHOPIFY_API_URL, {
+            query: fulfillmentMutation,
+            variables: fulfillmentVariables
+        }, {
+            headers: {
+                'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (fulfillmentResponse.data.errors) {
+            console.error(`  - ERRO ao criar fulfillment para ${orderId}:`, fulfillmentResponse.data.errors);
+            return false;
+        }
+
+        const userErrors = fulfillmentResponse.data.data?.fulfillmentCreate?.userErrors;
         if (userErrors && userErrors.length > 0) {
-            console.error(`  - ERRO (userErrors) ao criar fulfillment local ${orderId}:`, userErrors);
-            return null;
+            console.error(`  - ERRO (userErrors) ao criar fulfillment para ${orderId}:`, userErrors);
+            return false;
         }
 
-        const fulfillmentOrders = response.data.data?.fulfillmentOrderMarkAsLocal?.fulfillmentOrders;
-        return fulfillmentOrders || [];
-    } catch (error) { 
-        console.error(`Erro na API ao criar fulfillment local ${orderId}:`, error.response?.data || error.message); 
-        return null; 
+        return true;
+
+    } catch (error) {
+        console.error(`Erro na API ao criar fulfillment para pickup ${orderId}:`, error.response?.data || error.message);
+        return false;
     }
 };
 const markOrderReadyForPickup = async (fulfillmentOrderId) => {
@@ -256,48 +322,19 @@ const processOrders = async () => {
             edge.node.deliveryMethod?.methodType === 'PICKUP'
         );
 
-        // Se não tem fulfillment orders de pickup, precisa criar
+        // Se não tem fulfillment orders de pickup, precisa criar fulfillment direto
         if (pickupFulfillments.length === 0 && shopifyOrder.displayFulfillmentStatus === 'UNFULFILLED') {
-            console.log(`  - [Bling #${order.numero}] Criando fulfillment order para pickup...`);
-            const newFulfillmentOrders = await createPickupFulfillmentOrder(shopifyOrder.id);
+            console.log(`  - [Bling #${order.numero}] Criando fulfillment para pickup...`);
+            const success = await createPickupFulfillment(shopifyOrder.id);
             
-            if (!newFulfillmentOrders || newFulfillmentOrders.length === 0) {
-                console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao criar fulfillment order para pickup.`);
+            if (!success) {
+                console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao criar fulfillment para pickup.`);
                 continue;
             }
 
-            // Atualiza a lista com os novos fulfillment orders
-            pickupFulfillments = newFulfillmentOrders
-                .filter(fo => fo.deliveryMethod?.methodType === 'PICKUP')
-                .map(fo => ({ node: fo }));
-        }
-
-        // Filtra apenas os que ainda não estão prontos para retirada
-        const fulfillmentsToProcess = pickupFulfillments.filter(edge => 
-            edge.node.status !== 'READY_FOR_PICKUP' && edge.node.status !== 'PICKED_UP'
-        );
-
-        if (fulfillmentsToProcess.length === 0) {
-            console.log(`  - [Bling #${order.numero}] AVISO: Nenhum fulfillment de pickup para processar (já está pronto ou foi retirado).`);
-            continue;
-        }
-
-        console.log(`  - [Bling #${order.numero}] Marcando como 'Pronto para Retirada' no Shopify...`);
-        let shopifySuccess = true;
-
-        for (const fulfillmentEdge of fulfillmentsToProcess) {
-            const fulfillmentOrderId = fulfillmentEdge.node.id;
-            const success = await markOrderReadyForPickup(fulfillmentOrderId);
-            if (!success) {
-                shopifySuccess = false;
-                console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao marcar fulfillment ${fulfillmentOrderId} como pronto.`);
-            } else {
-                console.log(`  - ✅ [Bling #${order.numero}] Fulfillment ${fulfillmentOrderId} marcado como pronto para retirada.`);
-            }
-        }
-
-        if (shopifySuccess) {
-            console.log(`  - [Bling #${order.numero}] SUCESSO no Shopify. Atualizando Bling para 'Atendido'...`);
+            console.log(`  - ✅ [Bling #${order.numero}] Fulfillment criado com sucesso - pedido marcado como pronto para retirada.`);
+            
+            // Se conseguiu criar o fulfillment, pode atualizar o Bling
             const STATUS_ATENDIDO_BLING = 9;
             const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
             if (blingSuccess) {
@@ -305,12 +342,63 @@ const processOrders = async () => {
             } else {
                 console.error(`  - ❌ [Bling #${order.numero}] ERRO CRÍTICO: Shopify OK, mas FALHA ao atualizar no Bling.`);
             }
-        } else {
-            console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao marcar como pronto para retirada no Shopify.`);
+            continue;
         }
+
+        // Para pedidos já FULFILLED, verifica se precisa de processamento adicional
+        if (shopifyOrder.displayFulfillmentStatus === 'FULFILLED') {
+            console.log(`  - [Bling #${order.numero}] Pedido já está FULFILLED. Verificando se precisa marcar como pronto para retirada...`);
+            
+            // Se já está fulfilled mas ainda tem fulfillment orders que podem ser marcados como ready for pickup
+            const fulfillmentsToProcess = pickupFulfillments.filter(edge => 
+                edge.node.status !== 'READY_FOR_PICKUP' && edge.node.status !== 'PICKED_UP'
+            );
+
+            if (fulfillmentsToProcess.length === 0) {
+                console.log(`  - [Bling #${order.numero}] AVISO: Pedido já processado completamente.`);
+                // Mesmo assim, atualiza o Bling já que o pedido está pronto
+                const STATUS_ATENDIDO_BLING = 9;
+                const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
+                if (blingSuccess) {
+                    console.log(`  - ✅ [Bling #${order.numero}] Status atualizado no Bling para 'Atendido'.`);
+                }
+                continue;
+            }
+
+            // Processa fulfillment orders que ainda podem ser marcados como ready
+            console.log(`  - [Bling #${order.numero}] Tentando marcar fulfillments como 'Pronto para Retirada'...`);
+            let shopifySuccess = true;
+
+            for (const fulfillmentEdge of fulfillmentsToProcess) {
+                const fulfillmentOrderId = fulfillmentEdge.node.id;
+                const success = await markOrderReadyForPickup(fulfillmentOrderId);
+                if (!success) {
+                    shopifySuccess = false;
+                    console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao marcar fulfillment ${fulfillmentOrderId} como pronto.`);
+                } else {
+                    console.log(`  - ✅ [Bling #${order.numero}] Fulfillment ${fulfillmentOrderId} marcado como pronto para retirada.`);
+                }
+            }
+
+            if (shopifySuccess) {
+                console.log(`  - [Bling #${order.numero}] SUCESSO no Shopify. Atualizando Bling para 'Atendido'...`);
+                const STATUS_ATENDIDO_BLING = 9;
+                const blingSuccess = await updateBlingOrderStatus(token, blingOrderId, STATUS_ATENDIDO_BLING);
+                if (blingSuccess) {
+                    console.log(`  - ✅ [Bling #${order.numero}] SUCESSO COMPLETO!`);
+                } else {
+                    console.error(`  - ❌ [Bling #${order.numero}] ERRO CRÍTICO: Shopify OK, mas FALHA ao atualizar no Bling.`);
+                }
+            }
+            continue;
+        }
+
+        // Se chegou aqui, é um caso não tratado
+        console.log(`  - [Bling #${order.numero}] AVISO: Caso não tratado - Status: ${shopifyOrder.displayFulfillmentStatus}, Fulfillments: ${pickupFulfillments.length}`);
+    }
     }
     console.log("============================== TAREFA FINALIZADA ==============================\n");
-};
+
 
 // --- INICIALIZAÇÃO ---
 const PORT = process.env.PORT || 3000;
