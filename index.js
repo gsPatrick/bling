@@ -97,19 +97,27 @@ const findShopifyOrderWithFulfillments = async (orderIdFromBling) => {
 };
 
 // NOVA FUNÇÃO: Cria um fulfillment para pickup (quando o pedido está UNFULFILLED)
+// Corrigido: cria fulfillment via lineItemsByFulfillmentOrder
 const createPickupFulfillment = async (orderId) => {
-    // Primeiro, vamos buscar os line items do pedido
-    const orderQuery = `
-        query getOrderLineItems($id: ID!) {
+    // Query para pegar os fulfillmentOrders e seus itens
+    const fulfillmentOrderQuery = `
+        query getFulfillmentOrders($id: ID!) {
             node(id: $id) {
                 ... on Order {
                     id
-                    lineItems(first: 50) {
+                    fulfillmentOrders(first: 10) {
                         edges {
                             node {
                                 id
-                                quantity
-                                fulfillableQuantity
+                                status
+                                lineItems(first: 50) {
+                                    edges {
+                                        node {
+                                            id
+                                            remainingQuantity
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -117,43 +125,50 @@ const createPickupFulfillment = async (orderId) => {
             }
         }
     `;
-    
+
     try {
-        const orderResponse = await axios.post(process.env.SHOPIFY_API_URL, { 
-            query: orderQuery, 
-            variables: { id: orderId } 
-        }, { 
-            headers: { 
-                'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN, 
-                'Content-Type': 'application/json' 
-            } 
+        const fulfillmentOrderResponse = await axios.post(process.env.SHOPIFY_API_URL, {
+            query: fulfillmentOrderQuery,
+            variables: { id: orderId }
+        }, {
+            headers: {
+                'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+                'Content-Type': 'application/json'
+            }
         });
-        
-        if (orderResponse.data.errors) {
-            console.error(`  - ERRO ao buscar line items do pedido ${orderId}:`, orderResponse.data.errors);
+
+        if (fulfillmentOrderResponse.data.errors) {
+            console.error(`  - ERRO ao buscar fulfillmentOrders do pedido ${orderId}:`, fulfillmentOrderResponse.data.errors);
             return false;
         }
 
-        const lineItems = orderResponse.data.data.node.lineItems.edges;
-        if (!lineItems || lineItems.length === 0) {
-            console.error(`  - ERRO: Nenhum line item encontrado no pedido ${orderId}`);
+        const fulfillmentOrders = fulfillmentOrderResponse.data.data.node.fulfillmentOrders.edges;
+        if (!fulfillmentOrders || fulfillmentOrders.length === 0) {
+            console.error(`  - ERRO: Nenhum fulfillmentOrder encontrado no pedido ${orderId}`);
             return false;
         }
 
-        // Prepara os line items para fulfillment
-        const lineItemsToFulfill = lineItems
-            .filter(edge => edge.node.fulfillableQuantity > 0)
-            .map(edge => ({
-                id: edge.node.id,
-                quantity: edge.node.fulfillableQuantity
-            }));
+        // Monta os lineItemsByFulfillmentOrder
+        const lineItemsByFulfillmentOrder = fulfillmentOrders.map(edge => {
+            const orderLineItems = edge.node.lineItems.edges
+                .filter(item => item.node.remainingQuantity > 0)
+                .map(item => ({
+                    id: item.node.id,
+                    quantity: item.node.remainingQuantity
+                }));
 
-        if (lineItemsToFulfill.length === 0) {
-            console.log(`  - AVISO: Nenhum item fulfillable no pedido ${orderId}`);
+            return {
+                fulfillmentOrderId: edge.node.id,
+                fulfillmentOrderLineItems: orderLineItems
+            };
+        }).filter(entry => entry.fulfillmentOrderLineItems.length > 0);
+
+        if (lineItemsByFulfillmentOrder.length === 0) {
+            console.log(`  - AVISO: Nenhum item disponível para fulfillment no pedido ${orderId}`);
             return false;
         }
 
-        // Cria o fulfillment
+        // Mutation correta usando lineItemsByFulfillmentOrder
         const fulfillmentMutation = `
             mutation fulfillmentCreate($fulfillment: FulfillmentInput!) {
                 fulfillmentCreate(fulfillment: $fulfillment) {
@@ -171,7 +186,7 @@ const createPickupFulfillment = async (orderId) => {
 
         const fulfillmentVariables = {
             fulfillment: {
-                lineItems: lineItemsToFulfill,
+                lineItemsByFulfillmentOrder,
                 notifyCustomer: false,
                 trackingInfo: {
                     company: "Pickup Local",
@@ -201,6 +216,7 @@ const createPickupFulfillment = async (orderId) => {
             return false;
         }
 
+        console.log(`  - ✅ Fulfillment criado com sucesso para ${orderId}`);
         return true;
 
     } catch (error) {
@@ -208,6 +224,7 @@ const createPickupFulfillment = async (orderId) => {
         return false;
     }
 };
+
 const markOrderReadyForPickup = async (fulfillmentOrderId) => {
     const mutation = `
         mutation fulfillmentOrderMarkAsReadyForPickup($id: ID!) {
