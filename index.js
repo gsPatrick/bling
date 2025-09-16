@@ -320,7 +320,8 @@ const processOrders = async () => {
 
         // Se não tem fulfillment orders de pickup, precisa criar fulfillment direto
         if (pickupFulfillments.length === 0 && shopifyOrder.displayFulfillmentStatus === 'UNFULFILLED') {
-            console.log(`  - [Bling #${order.numero}] Criando fulfillment para pickup...`);
+            console.log(`  - [Bling #${order.numero}] Marcando pedido como pronto para retirada...`);
+
             const success = await prepareOrderForPickup(shopifyOrder.id);
             
             if (!success) {
