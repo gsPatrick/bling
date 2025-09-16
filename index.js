@@ -225,6 +225,113 @@ const createPickupFulfillment = async (orderId) => {
     }
 };
 
+// --- NOVA FUNÇÃO: marca os fulfillmentOrders do pedido como "Pronto para Retirada" ---
+const prepareOrderForPickup = async (orderId) => {
+  // Query: busca fulfillmentOrders + deliveryMethod + line items (remainingQuantity)
+  const query = `
+    query getFulfillmentOrders($id: ID!) {
+      node(id: $id) {
+        ... on Order {
+          id
+          fulfillmentOrders(first: 10) {
+            edges {
+              node {
+                id
+                status
+                deliveryMethod {
+                  methodType
+                }
+                lineItems(first: 50) {
+                  edges {
+                    node {
+                      id
+                      remainingQuantity
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const orderResp = await axios.post(process.env.SHOPIFY_API_URL, {
+      query,
+      variables: { id: orderId }
+    }, {
+      headers: {
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (orderResp.data.errors) {
+      console.error(`  - ERRO ao buscar fulfillmentOrders do pedido ${orderId}:`, orderResp.data.errors);
+      return false;
+    }
+
+    const edges = orderResp.data.data.node?.fulfillmentOrders?.edges || [];
+    // filtra apenas fulfillmentOrders do tipo PICKUP com items restante (>0)
+    const pickupFulfillmentOrders = edges
+      .filter(e => e.node.deliveryMethod?.methodType === 'PICKUP')
+      .filter(e => (e.node.lineItems.edges || []).some(li => li.node.remainingQuantity > 0))
+      .map(e => ({ fulfillmentOrderId: e.node.id }));
+
+    if (pickupFulfillmentOrders.length === 0) {
+      console.log(`  - AVISO: Nenhum fulfillmentOrder de pickup com itens fulfillable no pedido ${orderId}`);
+      return false;
+    }
+
+    // Mutation oficial para marcar como "Ready For Pickup"
+    const mutation = `
+      mutation fulfillmentOrderLineItemsPreparedForPickup($input: FulfillmentOrderLineItemsPreparedForPickupInput!) {
+        fulfillmentOrderLineItemsPreparedForPickup(input: $input) {
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const variables = {
+      input: {
+        lineItemsByFulfillmentOrder: pickupFulfillmentOrders
+        // se quiser marcar itens específicos, cada entry pode incluir "fulfillmentOrderLineItems": [{ id, quantity }]
+      }
+    };
+
+    const prepResp = await axios.post(process.env.SHOPIFY_API_URL, {
+      query: mutation,
+      variables
+    }, {
+      headers: {
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (prepResp.data.errors) {
+      console.error(`  - ERRO ao marcar como pronto para retirada ${orderId}:`, prepResp.data.errors);
+      return false;
+    }
+
+    const userErrors = prepResp.data.data?.fulfillmentOrderLineItemsPreparedForPickup?.userErrors;
+    if (userErrors && userErrors.length > 0) {
+      console.error(`  - ERRO (userErrors) ao marcar como pronto para retirada ${orderId}:`, userErrors);
+      return false;
+    }
+
+    console.log(`  - ✅ Pedido ${orderId} marcado como PRONTO PARA RETIRADA.`);
+    return true;
+
+  } catch (err) {
+    console.error(`  - ERRO de conexão ao marcar como pronto para retirada ${orderId}:`, err.response?.data || err.message);
+    return false;
+  }
+};
+
+
 const markOrderReadyForPickup = async (fulfillmentOrderId) => {
     const mutation = `
         mutation fulfillmentOrderMarkAsReadyForPickup($id: ID!) {
@@ -342,7 +449,7 @@ const processOrders = async () => {
         // Se não tem fulfillment orders de pickup, precisa criar fulfillment direto
         if (pickupFulfillments.length === 0 && shopifyOrder.displayFulfillmentStatus === 'UNFULFILLED') {
             console.log(`  - [Bling #${order.numero}] Criando fulfillment para pickup...`);
-            const success = await createPickupFulfillment(shopifyOrder.id);
+            const success = await prepareOrderForPickup(shopifyOrder.id);
             
             if (!success) {
                 console.error(`  - ❌ [Bling #${order.numero}] ERRO: Falha ao criar fulfillment para pickup.`);
