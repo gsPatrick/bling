@@ -193,9 +193,26 @@ const markOrderAsReadyForPickup = async (shopifyOrder) => {
 
 const updateBlingOrderStatus = async (token, blingOrderId, newStatusId) => {
     try {
-        await axios.put(`https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`, { idSituacao: newStatusId }, { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } });
+        console.log(`    - Tentando atualizar pedido Bling ${blingOrderId} para status ${newStatusId}...`);
+        
+        const response = await axios.put(`https://www.bling.com.br/Api/v3/pedidos/vendas/${blingOrderId}`, 
+            { idSituacao: newStatusId }, 
+            { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+        );
+        
+        console.log(`    - ✅ Status do pedido Bling ${blingOrderId} atualizado com sucesso.`);
         return true;
-    } catch (error) { console.error(`Erro ao atualizar status do pedido ${blingOrderId} no Bling:`, error.response?.data || error.message); return false; }
+        
+    } catch (error) { 
+        console.error(`    - ❌ Erro ao atualizar status do pedido ${blingOrderId} no Bling:`, error.response?.data || error.message); 
+        
+        // Debug adicional para ver detalhes do erro
+        if (error.response?.data) {
+            console.error(`    - Detalhes do erro:`, JSON.stringify(error.response.data, null, 2));
+        }
+        
+        return false; 
+    }
 };
 
 // --- WEBHOOK ---
