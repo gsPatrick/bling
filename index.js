@@ -101,25 +101,26 @@ const markOrderAsReadyForPickup = async (shopifyOrder) => {
     try {
         console.log(`  - Iniciando processo para marcar pedido ${shopifyOrder.name} como pronto para retirada...`);
         
-        // Busca fulfillment orders do tipo PICKUP
+        // NOVA ABORDAGEM: Se veio do Bling, confiamos que é retirada
+        // Processamos TODOS os fulfillment orders que têm itens para fulfillment
         const fulfillmentOrders = shopifyOrder.fulfillmentOrders?.edges || [];
-        const pickupFulfillmentOrders = fulfillmentOrders.filter(edge => {
+        const fulfillmentOrdersToProcess = fulfillmentOrders.filter(edge => {
             const fo = edge.node;
-            return fo.deliveryMethod?.methodType === 'PICKUP' && 
-                   fo.status !== 'READY_FOR_PICKUP' &&
+            return fo.status !== 'READY_FOR_PICKUP' &&
+                   fo.status !== 'PICKED_UP' &&
                    fo.lineItems.edges.some(li => li.node.remainingQuantity > 0);
         });
 
-        if (pickupFulfillmentOrders.length === 0) {
-            console.log(`  - ⚠️ Nenhum fulfillment order de pickup encontrado ou já está pronto para retirada.`);
+        if (fulfillmentOrdersToProcess.length === 0) {
+            console.log(`  - ⚠️ Nenhum fulfillment order encontrado para processar ou já está pronto/retirado.`);
             return false;
         }
 
-        console.log(`  - Encontrados ${pickupFulfillmentOrders.length} fulfillment order(s) de pickup para processar.`);
+        console.log(`  - Encontrados ${fulfillmentOrdersToProcess.length} fulfillment order(s) para processar.`);
 
         // Para cada fulfillment order, marca como pronto para retirada
         let successCount = 0;
-        for (const foEdge of pickupFulfillmentOrders) {
+        for (const foEdge of fulfillmentOrdersToProcess) {
             const fulfillmentOrder = foEdge.node;
             console.log(`    - Processando fulfillment order: ${fulfillmentOrder.id} (status: ${fulfillmentOrder.status})`);
             
@@ -163,6 +164,7 @@ const markOrderAsReadyForPickup = async (shopifyOrder) => {
                 const userErrors = response.data.data?.fulfillmentOrderLineItemsPreparedForPickup?.userErrors;
                 if (userErrors && userErrors.length > 0) {
                     console.error(`    - ❌ Erro ao processar fulfillment order:`, userErrors);
+                    console.error(`    - Detalhes dos erros:`, JSON.stringify(userErrors, null, 2));
                     continue;
                 }
 
@@ -176,7 +178,7 @@ const markOrderAsReadyForPickup = async (shopifyOrder) => {
         }
 
         if (successCount > 0) {
-            console.log(`  - ✅ ${successCount}/${pickupFulfillmentOrders.length} fulfillment order(s) marcados como pronto para retirada.`);
+            console.log(`  - ✅ ${successCount}/${fulfillmentOrdersToProcess.length} fulfillment order(s) marcados como pronto para retirada.`);
             return true;
         } else {
             console.log(`  - ❌ Nenhum fulfillment order foi processado com sucesso.`);
@@ -258,15 +260,16 @@ const processOrders = async () => {
 
         console.log(`  - [Bling #${order.numero}] Status atual: ${shopifyOrder.displayFulfillmentStatus}, Método de entrega: ${shopifyOrder.shippingLine?.title || 'N/A'}`);
 
-        // Verifica se é pedido de pickup (melhor verificação)
-        const hasPickupFulfillmentOrder = shopifyOrder.fulfillmentOrders?.edges?.some(edge => 
-            edge.node.deliveryMethod?.methodType === 'PICKUP'
-        );
-
-        if (!hasPickupFulfillmentOrder) {
-            console.log(`  - [Bling #${order.numero}] PULANDO: Não é um pedido de retirada (sem fulfillment order do tipo PICKUP)`);
-            continue;
-        }
+        // Se veio do Bling com status "Aguardando Retirada", então É retirada - confiamos no Bling
+        console.log(`  - [Bling #${order.numero}] ✓ Confirmado como pedido de retirada pelo Bling.`);
+        
+        // Debug: vamos ver os fulfillment orders disponíveis
+        const fulfillmentOrders = shopifyOrder.fulfillmentOrders?.edges || [];
+        console.log(`  - [Bling #${order.numero}] Fulfillment orders encontrados: ${fulfillmentOrders.length}`);
+        fulfillmentOrders.forEach((edge, index) => {
+            const fo = edge.node;
+            console.log(`    - FO ${index + 1}: ID=${fo.id}, Status=${fo.status}, DeliveryType=${fo.deliveryMethod?.methodType || 'N/A'}`);
+        });
 
         // Marca pedido como pronto para retirada
         const success = await markOrderAsReadyForPickup(shopifyOrder);
