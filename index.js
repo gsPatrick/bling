@@ -427,7 +427,23 @@ async function processOrders(blingOrders) {
 // --- INICIALIZAÇÃO ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    cron.schedule("*/30 * * * * *", processOrders);
+    cron.schedule("*/30 * * * * *", async () => {
+  const token = await getTokenFromCache();
+  if (!token) return console.warn("Não há token Bling válido. Aguardando autenticação...");
+
+  try {
+    const blingOrders = await getBlingOrdersWithStatus(token, 'Aguardando Retirada'); // ou ID do status correto
+    if (!Array.isArray(blingOrders) || blingOrders.length === 0) {
+      console.log("Nenhum pedido 'Aguardando Retirada' encontrado.");
+      return;
+    }
+
+    await processOrders(blingOrders); // Agora passa o array corretamente
+  } catch (err) {
+    console.error("Erro ao processar pedidos:", err.message);
+  }
+});
+
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log('Tarefa agendada para executar a cada 30 segundos.');
 });
